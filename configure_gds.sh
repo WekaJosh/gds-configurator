@@ -1017,7 +1017,6 @@ run_phase() {
         else
             HOST_STATUS["$host"]="OK"
             HOST_MESSAGE["$host"]="No changes needed"
-            echo "  No changes needed"
         fi
         echo ""
 
