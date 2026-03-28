@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# configure_gds.sh — Configure and validate NVIDIA GDS for WEKA access
+# configure_gds.sh — Configure and validate NVIDIA GDS for storage access
 #
-# Usage: configure_gds.sh [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+# Usage: configure_gds.sh [-l] [-c] [-t type] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 #
 #   -l            Run on the local system (no SSH)
 #   -c            Validate: check GDS configuration and parse gdscheck -p output
+#   -t type       Storage backend: weka,lustre,nfs,beegfs,gpfs,scatefs,nvme,auto (default: auto)
 #   ip_file       File containing one IP address per line (blank lines and # comments ignored)
 #   ip [ip ...]   One or more IP addresses/hostnames passed directly on the command line
 #   -u user   SSH username (default: root)
@@ -19,7 +20,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
+VALID_BACKENDS="weka lustre nfs beegfs gpfs scatefs nvme"
 DEFAULT_USER="root"
 DEFAULT_PORT=22
 
@@ -34,6 +36,7 @@ VERBOSE=false
 FORCE=false
 LOCAL_MODE=false
 VALIDATE_MODE=false
+BACKEND_TYPE="auto"
 
 declare -a HOSTS=()
 declare -A HOST_STATUS=()   # host -> SUCCESS | FAILED | SKIPPED
@@ -47,10 +50,13 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
 
 usage() {
     cat <<EOF
-Usage: $0 [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+Usage: $0 [-l] [-c] [-t type] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 
   -l            Run on the local system (no SSH, no hosts needed)
   -c            Validate: check GDS config and run gdscheck -p
+  -t type       Storage backend (default: auto)
+                  weka, lustre, nfs, beegfs, gpfs, scatefs, nvme, auto
+                  Comma-separated for multiple: -t lustre,nvme
   ip_file       File with one IP address per line (# comments and blank lines ok)
   ip [ip ...]   One or more IP addresses/hostnames passed directly
 
@@ -62,13 +68,14 @@ Usage: $0 [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] 
   -f        Skip confirmation prompt
 
 Examples:
-  $0 -l                          # configure the local system
-  $0 -l -c                       # validate the local system
-  $0 -l -d -v                    # local dry-run with verbose output
-  $0 hosts.txt -u ubuntu -c      # validate remote hosts
-  $0 hosts.txt                   # configure remote hosts from file
-  $0 10.0.0.1 10.0.0.2 -u admin  # configure remote hosts inline
-  $0 hosts.txt 10.0.0.99 -d -v   # mixed file + inline, dry-run
+  $0 -l                             # configure local (auto-detect backend)
+  $0 -l -t weka                     # configure local for WEKA
+  $0 -l -c                          # validate the local system
+  $0 hosts.txt -u ubuntu -t lustre  # configure remote hosts for Lustre
+  $0 hosts.txt -u ubuntu            # auto-detect and configure
+  $0 hosts.txt -u ubuntu -c         # validate remote hosts
+  $0 -l -t nvme -d -v               # NVMe P2P dry-run locally
+  $0 hosts.txt -t lustre,nvme -d -v # multi-backend dry-run
 
 Version: $SCRIPT_VERSION
 EOF
@@ -100,11 +107,12 @@ parse_args() {
     fi
 
     OPTIND=1
-    while getopts ":u:k:p:dvflc" opt; do
+    while getopts ":u:k:p:t:dvflc" opt; do
         case "$opt" in
             u) SSH_USER="$OPTARG" ;;
             k) SSH_KEYFILE="$OPTARG" ;;
             p) SSH_PORT="$OPTARG" ;;
+            t) BACKEND_TYPE="$OPTARG" ;;
             d) DRY_RUN=true ;;
             v) VERBOSE=true ;;
             f) FORCE=true ;;
@@ -114,6 +122,22 @@ parse_args() {
             \?) err "Unknown option: -$OPTARG"; usage ;;
         esac
     done
+
+    # Validate backend type(s)
+    if [[ "$BACKEND_TYPE" != "auto" ]]; then
+        local b
+        for b in ${BACKEND_TYPE//,/ }; do
+            local valid=false
+            local vb
+            for vb in $VALID_BACKENDS; do
+                if [[ "$b" == "$vb" ]]; then valid=true; break; fi
+            done
+            if [[ "$valid" != true ]]; then
+                err "Unknown backend type: $b (valid: $VALID_BACKENDS)"
+                usage
+            fi
+        done
+    fi
 
     # Warn if hosts were provided alongside -l
     if [[ "$LOCAL_MODE" == true && ${#RAW_TARGETS[@]} -gt 0 ]]; then
@@ -397,6 +421,217 @@ resolve_rdma_addresses() {
     echo "[INFO]  RDMA addresses for cufile.json: ${RDMA_ADDR_LIST[*]}"
 }
 
+# ============================================================
+# Backend profile functions
+# Each backend defines: needs_rdma, needs_mount_table, mount_type
+# Configuration and validation are dispatched per-backend.
+# ============================================================
+
+# --- WEKA ---
+backend_weka_needs_rdma()       { echo "true"; }
+backend_weka_needs_mount_table() { echo "false"; }
+backend_weka_mount_type()       { echo "wekafs"; }
+backend_weka_gdscheck_name()    { echo "WekaFS"; }
+
+# --- Lustre ---
+backend_lustre_needs_rdma()       { echo "true"; }
+backend_lustre_needs_mount_table() { echo "true"; }
+backend_lustre_mount_type()       { echo "lustre"; }
+backend_lustre_gdscheck_name()    { echo "Lustre"; }
+
+# --- NFS (includes VAST) ---
+backend_nfs_needs_rdma()       { echo "true"; }
+backend_nfs_needs_mount_table() { echo "true"; }
+backend_nfs_mount_type()       { echo "nfs"; }
+backend_nfs_gdscheck_name()    { echo "NFS"; }
+
+# --- BeeGFS ---
+backend_beegfs_needs_rdma()       { echo "true"; }
+backend_beegfs_needs_mount_table() { echo "true"; }
+backend_beegfs_mount_type()       { echo "beegfs"; }
+backend_beegfs_gdscheck_name()    { echo "BeeGFS"; }
+
+# --- GPFS (IBM Spectrum Scale) ---
+backend_gpfs_needs_rdma()       { echo "true"; }
+backend_gpfs_needs_mount_table() { echo "true"; }
+backend_gpfs_mount_type()       { echo "gpfs"; }
+backend_gpfs_gdscheck_name()    { echo "IBM Spectrum Scale"; }
+
+# --- ScaTeFS ---
+backend_scatefs_needs_rdma()       { echo "true"; }
+backend_scatefs_needs_mount_table() { echo "true"; }
+backend_scatefs_mount_type()       { echo "scatefs"; }
+backend_scatefs_gdscheck_name()    { echo "ScaTeFS"; }
+
+# --- NVMe (local P2P) ---
+backend_nvme_needs_rdma()       { echo "false"; }
+backend_nvme_needs_mount_table() { echo "false"; }
+backend_nvme_mount_type()       { echo ""; }
+backend_nvme_gdscheck_name()    { echo "NVMe"; }
+
+# ============================================================
+# Auto-detection and mount discovery
+# ============================================================
+
+auto_detect_backends() {
+    # Scan the system for active storage backends.
+    # Sets ACTIVE_BACKENDS array.
+    declare -ga ACTIVE_BACKENDS=()
+
+    # Check for WEKA
+    if mount -t wekafs 2>/dev/null | grep -q wekafs || command -v weka &>/dev/null; then
+        ACTIVE_BACKENDS+=("weka")
+        echo "[INFO]  Auto-detected: weka"
+    fi
+
+    # Check for Lustre
+    if mount -t lustre 2>/dev/null | grep -q lustre; then
+        ACTIVE_BACKENDS+=("lustre")
+        echo "[INFO]  Auto-detected: lustre"
+    fi
+
+    # Check for NFS (includes VAST which uses NFS)
+    if mount -t nfs 2>/dev/null | grep -q nfs || mount -t nfs4 2>/dev/null | grep -q nfs4; then
+        ACTIVE_BACKENDS+=("nfs")
+        echo "[INFO]  Auto-detected: nfs"
+    fi
+
+    # Check for BeeGFS
+    if mount -t beegfs 2>/dev/null | grep -q beegfs || mount -t fuse.beegfs 2>/dev/null | grep -q beegfs; then
+        ACTIVE_BACKENDS+=("beegfs")
+        echo "[INFO]  Auto-detected: beegfs"
+    fi
+
+    # Check for GPFS
+    if mount -t gpfs 2>/dev/null | grep -q gpfs; then
+        ACTIVE_BACKENDS+=("gpfs")
+        echo "[INFO]  Auto-detected: gpfs"
+    fi
+
+    # Check for ScaTeFS
+    if mount -t scatefs 2>/dev/null | grep -q scatefs; then
+        ACTIVE_BACKENDS+=("scatefs")
+        echo "[INFO]  Auto-detected: scatefs"
+    fi
+
+    # Check for NVMe devices on GPU PCIe buses
+    if [[ -d /sys/class/nvme ]]; then
+        local nvme_count
+        nvme_count=$(ls -d /sys/class/nvme/nvme* 2>/dev/null | wc -l)
+        if [[ "$nvme_count" -gt 0 ]]; then
+            ACTIVE_BACKENDS+=("nvme")
+            echo "[INFO]  Auto-detected: nvme ($nvme_count controller(s))"
+        fi
+    fi
+
+    if [[ ${#ACTIVE_BACKENDS[@]} -eq 0 ]]; then
+        echo "[WARN]  No storage backends auto-detected"
+        echo "[WARN]  Use -t to specify a backend explicitly"
+    fi
+}
+
+discover_mounts() {
+    # Discover mount points for a given filesystem type.
+    # Sets DISCOVERED_MOUNTS array.
+    local backend="$1"
+    declare -ga DISCOVERED_MOUNTS=()
+
+    local mount_type
+    mount_type=$(backend_${backend}_mount_type)
+    [[ -z "$mount_type" ]] && return
+
+    # Scan /proc/mounts for matching filesystem types
+    local types=("$mount_type")
+    # Add variant types
+    case "$backend" in
+        nfs) types+=("nfs4") ;;
+        beegfs) types+=("fuse.beegfs") ;;
+    esac
+
+    local t mount_point
+    for t in "${types[@]}"; do
+        while IFS=' ' read -r _ mount_point _ fs_type _; do
+            if [[ "$fs_type" == "$t" ]]; then
+                DISCOVERED_MOUNTS+=("$mount_point")
+            fi
+        done < /proc/mounts
+    done
+
+    if [[ ${#DISCOVERED_MOUNTS[@]} -gt 0 ]]; then
+        echo "[INFO]  Discovered ${#DISCOVERED_MOUNTS[@]} $backend mount(s): ${DISCOVERED_MOUNTS[*]}"
+    else
+        echo "[INFO]  No active $backend mounts found"
+    fi
+}
+
+detect_nvme_p2p_devices() {
+    # Detect NVMe controllers on the same PCIe root complex as GPUs.
+    declare -ga NVME_P2P_DEVS=()
+
+    if [[ ! -d /sys/class/nvme ]]; then
+        echo "[WARN]  /sys/class/nvme does not exist — no NVMe controllers found"
+        return
+    fi
+
+    # Build GPU root bus set (reuses GPU_NUMA_NODES from detect_gpu_numa_nodes)
+    declare -A GPU_PCIE_ROOTS=()
+    local bus_id
+    for bus_id in "${!GPU_NUMA_NODES[@]}"; do
+        local root
+        root=$(echo "$bus_id" | cut -d: -f1-2)
+        GPU_PCIE_ROOTS["$root"]=1
+    done
+
+    local nvme_dev
+    for nvme_dev in /sys/class/nvme/nvme*; do
+        [[ -d "$nvme_dev" ]] || continue
+        local dev_name
+        dev_name=$(basename "$nvme_dev")
+        local pci_path="${nvme_dev}/device"
+
+        if [[ -L "$pci_path" ]]; then
+            local pci_addr nvme_root
+            pci_addr=$(basename "$(readlink -f "$pci_path")")
+            nvme_root=$(echo "$pci_addr" | cut -d: -f1-2)
+
+            if [[ -n "${GPU_PCIE_ROOTS[$nvme_root]+x}" ]]; then
+                NVME_P2P_DEVS+=("$dev_name")
+                echo "[INFO]  $dev_name: PCIe root $nvme_root matches a GPU -> P2P capable"
+            else
+                echo "[INFO]  $dev_name: PCIe root $nvme_root does not match any GPU"
+            fi
+        fi
+    done
+
+    if [[ ${#NVME_P2P_DEVS[@]} -eq 0 ]]; then
+        echo "[WARN]  No NVMe controllers found on GPU PCIe buses"
+    else
+        echo "[INFO]  GPU-local NVMe controllers: ${NVME_P2P_DEVS[*]}"
+    fi
+}
+
+# Helper: check if any active backend needs RDMA
+any_backend_needs_rdma() {
+    local b
+    for b in "${ACTIVE_BACKENDS[@]}"; do
+        if [[ $(backend_${b}_needs_rdma) == "true" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Helper: check if any active backend needs mount tables
+any_backend_needs_mount_table() {
+    local b
+    for b in "${ACTIVE_BACKENDS[@]}"; do
+        if [[ $(backend_${b}_needs_mount_table) == "true" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 strip_json_comments() {
     # cufile.json ships with C-style // comments which are not valid JSON.
     # Strip them in-place before any JSON tool processes the file.
@@ -496,13 +731,33 @@ merge_and_write() {
     local NEW_JSON=""
     local JSON_TOOL=""
 
+    # Build backends and mount table data for the merge script
+    local backends_csv
+    backends_csv=$(IFS=,; echo "${ACTIVE_BACKENDS[*]}")
+    local mount_json="{}"
+    if any_backend_needs_mount_table; then
+        # Build mount table JSON: {"lustre": ["/mnt/lustre1"], "nfs": ["/mnt/data"]}
+        mount_json=$(python3 -c "
+import json, sys, os
+mt = {}
+for b in '${backends_csv}'.split(','):
+    mounts_var = os.environ.get(f'MOUNTS_{b.upper()}', '')
+    if mounts_var:
+        mt[b] = mounts_var.split(':')
+print(json.dumps(mt))
+" 2>/dev/null || echo "{}")
+    fi
+
     if command -v python3 &>/dev/null; then
         JSON_TOOL="python3"
-        NEW_JSON=$(python3 - "$TMPJSON" ${RDMA_ADDR_LIST[@]+"${RDMA_ADDR_LIST[@]}"} <<'PYEOF'
-import json, sys
+        NEW_JSON=$(ACTIVE_BACKENDS_CSV="$backends_csv" MOUNT_TABLE_JSON="$mount_json" \
+            python3 - "$TMPJSON" ${RDMA_ADDR_LIST[@]+"${RDMA_ADDR_LIST[@]}"} <<'PYEOF'
+import json, sys, os
 
 tmpfile = sys.argv[1]
 new_devs = sys.argv[2:]
+active_backends = os.environ.get("ACTIVE_BACKENDS_CSV", "weka").split(",")
+mount_table = json.loads(os.environ.get("MOUNT_TABLE_JSON", "{}"))
 
 with open(tmpfile) as f:
     try:
@@ -512,40 +767,92 @@ with open(tmpfile) as f:
         sys.exit(1)
 
 changes = []
-
-# --- properties section ---
 props = current.setdefault("properties", {})
-
-# rdma_dev_addr_list: merge detected devices
-existing = props.get("rdma_dev_addr_list", [])
-if not isinstance(existing, list):
-    print(f"[WARN]  rdma_dev_addr_list was not a list ({type(existing).__name__}), resetting to []",
-          file=sys.stderr)
-    existing = []
-merged = list(existing)
-for d in new_devs:
-    if d not in merged:
-        merged.append(d)
-        changes.append(f"rdma_dev_addr_list: added {d}")
-props["rdma_dev_addr_list"] = merged
-
-# use_compat_mode / allow_compat_mode: must be false for GDS direct path
-for key in ("use_compat_mode", "allow_compat_mode"):
-    if props.get(key) is not False:
-        props[key] = False
-        changes.append(f"{key}: set to false")
-
-# gds_rdma_write_support: must be true
-if props.get("gds_rdma_write_support") is not True:
-    props["gds_rdma_write_support"] = True
-    changes.append("gds_rdma_write_support: set to true")
-
-# --- fs.weka section ---
 fs = current.setdefault("fs", {})
-weka = fs.setdefault("weka", {})
-if weka.get("rdma_write_support") is not True:
-    weka["rdma_write_support"] = True
-    changes.append("fs.weka.rdma_write_support: set to true")
+
+# --- Common RDMA properties (for any RDMA backend) ---
+rdma_backends = {"weka", "lustre", "nfs", "beegfs", "gpfs", "scatefs"}
+has_rdma = any(b in rdma_backends for b in active_backends)
+
+if has_rdma:
+    # rdma_dev_addr_list: merge detected IPs
+    existing = props.get("rdma_dev_addr_list", [])
+    if not isinstance(existing, list):
+        print(f"[WARN]  rdma_dev_addr_list was not a list, resetting to []", file=sys.stderr)
+        existing = []
+    merged = list(existing)
+    for d in new_devs:
+        if d not in merged:
+            merged.append(d)
+            changes.append(f"rdma_dev_addr_list: added {d}")
+    props["rdma_dev_addr_list"] = merged
+
+    # Compat mode must be false for GDS direct path
+    for key in ("use_compat_mode", "allow_compat_mode"):
+        if props.get(key) is not False:
+            props[key] = False
+            changes.append(f"{key}: set to false")
+
+    # RDMA write support
+    if props.get("gds_rdma_write_support") is not True:
+        props["gds_rdma_write_support"] = True
+        changes.append("gds_rdma_write_support: set to true")
+
+# --- Per-backend fs.* configuration ---
+for backend in active_backends:
+    sect = fs.setdefault(backend, {}) if backend != "nvme" else None
+
+    if backend == "weka":
+        if sect.get("rdma_write_support") is not True:
+            sect["rdma_write_support"] = True
+            changes.append("fs.weka.rdma_write_support: set to true")
+
+    elif backend == "lustre":
+        if "posix_gds_min_kb" not in sect:
+            sect["posix_gds_min_kb"] = 0
+            changes.append("fs.lustre.posix_gds_min_kb: set to 0")
+
+    elif backend == "nfs":
+        pass  # NFS config is mount_table only
+
+    elif backend == "beegfs":
+        if "posix_gds_min_kb" not in sect:
+            sect["posix_gds_min_kb"] = 0
+            changes.append("fs.beegfs.posix_gds_min_kb: set to 0")
+
+    elif backend == "gpfs":
+        if sect.get("gds_write_support") is not True:
+            sect["gds_write_support"] = True
+            changes.append("fs.gpfs.gds_write_support: set to true")
+        if sect.get("gds_async_support") is not True:
+            sect["gds_async_support"] = True
+            changes.append("fs.gpfs.gds_async_support: set to true")
+
+    elif backend == "scatefs":
+        if "posix_gds_min_kb" not in sect:
+            sect["posix_gds_min_kb"] = 0
+            changes.append("fs.scatefs.posix_gds_min_kb: set to 0")
+
+    elif backend == "nvme":
+        if props.get("use_pci_p2pdma") is not True:
+            props["use_pci_p2pdma"] = True
+            changes.append("properties.use_pci_p2pdma: set to true")
+
+    # Mount table entries (for backends that need them)
+    if backend in mount_table and mount_table[backend]:
+        mt = sect.setdefault("mount_table", {})
+        for mpoint in mount_table[backend]:
+            entry = mt.setdefault(mpoint, {})
+            existing_mt = entry.get("rdma_dev_addr_list", [])
+            if not isinstance(existing_mt, list):
+                existing_mt = []
+            merged_mt = list(existing_mt)
+            for d in new_devs:
+                if d not in merged_mt:
+                    merged_mt.append(d)
+            if merged_mt != existing_mt:
+                entry["rdma_dev_addr_list"] = merged_mt
+                changes.append(f"fs.{backend}.mount_table.{mpoint}: updated rdma_dev_addr_list")
 
 if not changes:
     print("NO_CHANGES", file=sys.stderr)
@@ -571,17 +878,37 @@ PYEOF
         done
         devs_json+="]"
 
-        NEW_JSON=$(jq --argjson new_devs "$devs_json" '
-            # Merge RDMA devices
-            .properties.rdma_dev_addr_list = ((.properties.rdma_dev_addr_list // []) + $new_devs | unique) |
-            # Disable compat mode for GDS direct path
-            .properties.use_compat_mode = false |
-            .properties.allow_compat_mode = false |
-            # Enable RDMA write support
-            .properties.gds_rdma_write_support = true |
-            # Enable WEKA RDMA write support
-            .fs.weka.rdma_write_support = true
-        ' "$TMPJSON") \
+        # Build jq filter dynamically based on active backends
+        local jq_filter=""
+
+        # RDMA properties if any RDMA backend
+        if any_backend_needs_rdma; then
+            jq_filter+='.properties.rdma_dev_addr_list = ((.properties.rdma_dev_addr_list // []) + $new_devs | unique) | '
+            jq_filter+='.properties.use_compat_mode = false | '
+            jq_filter+='.properties.allow_compat_mode = false | '
+            jq_filter+='.properties.gds_rdma_write_support = true | '
+        fi
+
+        # Per-backend fs.* config
+        local b
+        for b in "${ACTIVE_BACKENDS[@]}"; do
+            case "$b" in
+                weka)    jq_filter+='.fs.weka.rdma_write_support = true | ' ;;
+                lustre)  jq_filter+='.fs.lustre.posix_gds_min_kb = (.fs.lustre.posix_gds_min_kb // 0) | ' ;;
+                beegfs)  jq_filter+='.fs.beegfs.posix_gds_min_kb = (.fs.beegfs.posix_gds_min_kb // 0) | ' ;;
+                gpfs)    jq_filter+='.fs.gpfs.gds_write_support = true | .fs.gpfs.gds_async_support = true | ' ;;
+                scatefs) jq_filter+='.fs.scatefs.posix_gds_min_kb = (.fs.scatefs.posix_gds_min_kb // 0) | ' ;;
+                nvme)    jq_filter+='.properties.use_pci_p2pdma = true | ' ;;
+                nfs)     ;; # NFS config is mount_table only
+            esac
+        done
+
+        # Remove trailing " | "
+        jq_filter="${jq_filter% | }"
+        # Default to identity if empty
+        [[ -z "$jq_filter" ]] && jq_filter="."
+
+        NEW_JSON=$(jq --argjson new_devs "$devs_json" "$jq_filter" "$TMPJSON") \
             || { rm -f "$TMPJSON"; echo "[ERROR] jq JSON manipulation failed"; return 1; }
     else
         rm -f "$TMPJSON"
@@ -898,39 +1225,77 @@ main_remote() {
         echo "[ERROR] nvidia-smi not found — is the NVIDIA driver installed?"
         exit 1
     fi
-    if [[ ! -d /sys/class/infiniband ]]; then
-        echo "[ERROR] /sys/class/infiniband does not exist — no RDMA subsystem found"
-        exit 1
-    fi
 
     # Check that GDS (nvidia-fs) is installed; install if missing
     ensure_gds_installed
 
-    # Step 2: GPU detection
+    # Step 2: GPU detection (needed by all backends for PCIe topology)
     detect_gpu_numa_nodes || exit 1
 
-    # Step 3: MLX device detection
-    detect_mlx_devices || exit 1
-
-    # Step 4: GPU-resident matching
-    find_gpu_resident_devs
-    if [[ ${#GPU_RESIDENT_DEVS[@]} -eq 0 ]]; then
-        exit 0
+    # Step 3: Determine active backends
+    declare -ga ACTIVE_BACKENDS=()
+    if [[ "$BACKEND_TYPE" == "auto" ]]; then
+        auto_detect_backends
+        if [[ ${#ACTIVE_BACKENDS[@]} -eq 0 ]]; then
+            echo "[ERROR] No storage backends detected. Use -t to specify one."
+            exit 1
+        fi
+    else
+        # Split comma-separated backend list
+        local b
+        for b in ${BACKEND_TYPE//,/ }; do
+            ACTIVE_BACKENDS+=("$b")
+        done
+        echo "[INFO]  Configured backend(s): ${ACTIVE_BACKENDS[*]}"
     fi
 
-    # Step 5: Resolve mlx devices to IP addresses for rdma_dev_addr_list
-    resolve_rdma_addresses
+    # Step 4: RDMA path (only if any active backend needs it)
+    if any_backend_needs_rdma; then
+        if [[ ! -d /sys/class/infiniband ]]; then
+            echo "[ERROR] /sys/class/infiniband does not exist — no RDMA subsystem found"
+            echo "[ERROR] RDMA is required for backend(s): ${ACTIVE_BACKENDS[*]}"
+            exit 1
+        fi
 
-    # Step 6: Ensure nvidia_peermem is loaded (required for GDS RDMA)
-    ensure_nvidia_peermem
+        detect_mlx_devices || exit 1
 
-    # Step 7: Ensure libcufile_rdma.so is findable
-    ensure_rdma_library
+        find_gpu_resident_devs
+        if [[ ${#GPU_RESIDENT_DEVS[@]} -eq 0 ]]; then
+            echo "[WARN]  No GPU-resident RDMA devices found"
+        else
+            resolve_rdma_addresses
+        fi
 
-    # Step 8: Read/create cufile.json
+        ensure_nvidia_peermem
+        ensure_rdma_library
+    fi
+
+    # Step 5: NVMe P2P path (only if nvme backend is active)
+    local b
+    for b in "${ACTIVE_BACKENDS[@]}"; do
+        if [[ "$b" == "nvme" ]]; then
+            detect_nvme_p2p_devices
+            break
+        fi
+    done
+
+    # Step 6: Discover mount points for backends that need mount tables
+    for b in "${ACTIVE_BACKENDS[@]}"; do
+        if [[ $(backend_${b}_needs_mount_table) == "true" ]]; then
+            discover_mounts "$b"
+            # Export discovered mounts for Python merge via env var
+            if [[ ${#DISCOVERED_MOUNTS[@]} -gt 0 ]]; then
+                local mounts_joined
+                mounts_joined=$(IFS=:; echo "${DISCOVERED_MOUNTS[*]}")
+                export "MOUNTS_${b^^}=${mounts_joined}"
+            fi
+        fi
+    done
+
+    # Step 7: Read/create cufile.json
     read_or_create_cufile
 
-    # Step 9: Merge and write
+    # Step 8: Merge and write
     merge_and_write || exit 1
 
     exit 0
@@ -1018,80 +1383,152 @@ gds_val() {
     echo "$GDS_OUTPUT" | grep -i "$pattern" | head -1 | sed 's/^[^:]*: *//'
 }
 
-# WekaFS
-val=$(gds_val "WekaFS")
-if [[ "$val" == *"Supported"* ]]; then
-    pass "WekaFS: $val"
+# Determine active backends for validation
+ACTIVE_BACKENDS=()
+if [[ "$BACKEND_TYPE" == "auto" ]]; then
+    # In validation mode, detect from cufile.json fs.* sections
+    if [[ -f /etc/cufile.json ]] && command -v python3 &>/dev/null; then
+        detected=$(python3 -c "
+import json, re
+try:
+    text = open('/etc/cufile.json').read()
+    # Strip comments
+    result = []; i = 0; in_str = False
+    while i < len(text):
+        if in_str:
+            if text[i] == '\\\\' and i+1 < len(text): result.append(text[i:i+2]); i += 2; continue
+            if text[i] == '\"': in_str = False
+            result.append(text[i]); i += 1
+        else:
+            if text[i] == '\"': in_str = True; result.append(text[i]); i += 1
+            elif i+1 < len(text) and text[i:i+2] == '//':
+                while i < len(text) and text[i] != '\n': i += 1
+            elif i+1 < len(text) and text[i:i+2] == '/*':
+                i += 2
+                while i+1 < len(text) and text[i:i+2] != '*/': i += 1
+                if i+1 < len(text): i += 2
+            else: result.append(text[i]); i += 1
+    d = json.loads(''.join(result))
+    backends = []
+    fs = d.get('fs', {})
+    for b in ('weka','lustre','nfs','beegfs','gpfs','scatefs'):
+        if b in fs: backends.append(b)
+    props = d.get('properties', {})
+    if props.get('use_pci_p2pdma'): backends.append('nvme')
+    print(','.join(backends) if backends else '')
+except: pass
+" 2>/dev/null)
+        if [[ -n "$detected" ]]; then
+            for b in ${detected//,/ }; do ACTIVE_BACKENDS+=("$b"); done
+            info "Auto-detected configured backends: ${ACTIVE_BACKENDS[*]}"
+        fi
+    fi
+    # Fallback: validate common checks only
+    if [[ ${#ACTIVE_BACKENDS[@]} -eq 0 ]]; then
+        info "Could not auto-detect backends, running universal checks only"
+    fi
 else
-    fail "WekaFS: $val (expected: Supported)"
+    for b in ${BACKEND_TYPE//,/ }; do ACTIVE_BACKENDS+=("$b"); done
 fi
 
-# Userspace RDMA
-val=$(gds_val "Userspace RDMA")
-if [[ "$val" == *"Supported"* ]]; then
-    pass "Userspace RDMA: $val"
-else
-    fail "Userspace RDMA: $val (expected: Supported)"
-fi
+# Determine if any active backend needs RDMA
+RDMA_BACKENDS="weka lustre nfs beegfs gpfs scatefs"
+HAS_RDMA_BACKEND=false
+for b in ${ACTIVE_BACKENDS[@]+"${ACTIVE_BACKENDS[@]}"}; do
+    for rb in $RDMA_BACKENDS; do
+        if [[ "$b" == "$rb" ]]; then HAS_RDMA_BACKEND=true; break 2; fi
+    done
+done
 
-# Mellanox PeerDirect
-val=$(gds_val "Mellanox PeerDirect")
-if [[ "$val" == *"Enabled"* ]]; then
-    pass "Mellanox PeerDirect: $val"
-else
-    fail "Mellanox PeerDirect: $val (expected: Enabled)"
-fi
+# --- Per-backend filesystem support check ---
+for b in ${ACTIVE_BACKENDS[@]+"${ACTIVE_BACKENDS[@]}"}; do
+    case "$b" in
+        weka)
+            val=$(gds_val "WekaFS")
+            if [[ "$val" == *"Supported"* ]]; then pass "WekaFS: $val"
+            else fail "WekaFS: $val (expected: Supported)"; fi
+            val=$(gds_val "weka.rdma_write_support")
+            if [[ "$val" == *"true"* ]]; then pass "fs.weka.rdma_write_support: $val"
+            else fail "fs.weka.rdma_write_support: $val (expected: true)"; fi
+            ;;
+        lustre)
+            val=$(gds_val "Lustre")
+            if [[ "$val" == *"Supported"* ]]; then pass "Lustre: $val"
+            else fail "Lustre: $val (expected: Supported)"; fi
+            ;;
+        nfs)
+            val=$(gds_val "NFS")
+            if [[ "$val" == *"Supported"* ]]; then pass "NFS: $val"
+            else fail "NFS: $val (expected: Supported)"; fi
+            ;;
+        beegfs)
+            val=$(gds_val "BeeGFS")
+            if [[ "$val" == *"Supported"* ]]; then pass "BeeGFS: $val"
+            else fail "BeeGFS: $val (expected: Supported)"; fi
+            ;;
+        gpfs)
+            val=$(gds_val "IBM Spectrum Scale")
+            if [[ "$val" == *"Supported"* ]]; then pass "GPFS: $val"
+            else fail "GPFS: $val (expected: Supported)"; fi
+            val=$(gds_val "gpfs.gds_write_support")
+            if [[ "$val" == *"true"* ]]; then pass "fs.gpfs.gds_write_support: $val"
+            else fail "fs.gpfs.gds_write_support: $val (expected: true)"; fi
+            ;;
+        scatefs)
+            val=$(gds_val "ScaTeFS")
+            if [[ "$val" == *"Supported"* ]]; then pass "ScaTeFS: $val"
+            else fail "ScaTeFS: $val (expected: Supported)"; fi
+            ;;
+        nvme)
+            val=$(gds_val "NVMe P2PDMA")
+            if [[ "$val" == *"Supported"* ]]; then pass "NVMe P2PDMA: $val"
+            else warn "NVMe P2PDMA: $val"; fi
+            val=$(gds_val "use_pci_p2pdma")
+            if [[ "$val" == *"true"* ]]; then pass "use_pci_p2pdma: $val"
+            else fail "use_pci_p2pdma: $val (expected: true)"; fi
+            ;;
+    esac
+done
 
-# RDMA library
-val=$(gds_val "rdma library")
-if [[ "$val" == *"Loaded"* ]]; then
-    pass "RDMA library: $val"
-else
-    fail "RDMA library: $val (expected: Loaded)"
-fi
+# --- RDMA checks (only if an RDMA backend is active) ---
+if [[ "$HAS_RDMA_BACKEND" == true ]]; then
+    echo ""
+    echo "=== RDMA Checks ==="
 
-# RDMA devices
-val=$(gds_val "rdma devices")
-if [[ "$val" == *"Configured"* ]]; then
-    pass "RDMA devices: $val"
-else
-    fail "RDMA devices: $val (expected: Configured)"
-fi
+    val=$(gds_val "Userspace RDMA")
+    if [[ "$val" == *"Supported"* ]]; then pass "Userspace RDMA: $val"
+    else fail "Userspace RDMA: $val (expected: Supported)"; fi
 
-# RDMA device status — extract Up/Down counts
-status_line=$(gds_val "rdma_device_status")
-up_count=$(echo "$status_line" | grep -o 'Up: *[0-9]*' | grep -o '[0-9]*' || echo "0")
-down_count=$(echo "$status_line" | grep -o 'Down: *[0-9]*' | grep -o '[0-9]*' || echo "0")
-if [[ "$down_count" -eq 0 && "$up_count" -gt 0 ]]; then
-    pass "RDMA device status: Up: $up_count Down: $down_count"
-elif [[ "$down_count" -gt 0 && "$up_count" -gt 0 ]]; then
-    warn "RDMA device status: Up: $up_count Down: $down_count"
-else
-    fail "RDMA device status: Up: $up_count Down: $down_count (no devices up)"
-fi
+    val=$(gds_val "Mellanox PeerDirect")
+    if [[ "$val" == *"Enabled"* ]]; then pass "Mellanox PeerDirect: $val"
+    else fail "Mellanox PeerDirect: $val (expected: Enabled)"; fi
 
-# use_compat_mode
-val=$(gds_val "use_compat_mode")
-if [[ "$val" == *"false"* ]]; then
-    pass "use_compat_mode: $val"
-else
-    fail "use_compat_mode: $val (expected: false)"
-fi
+    val=$(gds_val "rdma library")
+    if [[ "$val" == *"Loaded"* ]]; then pass "RDMA library: $val"
+    else fail "RDMA library: $val (expected: Loaded)"; fi
 
-# gds_rdma_write_support
-val=$(gds_val "gds_rdma_write_support")
-if [[ "$val" == *"true"* ]]; then
-    pass "gds_rdma_write_support: $val"
-else
-    fail "gds_rdma_write_support: $val (expected: true)"
-fi
+    val=$(gds_val "rdma devices")
+    if [[ "$val" == *"Configured"* ]]; then pass "RDMA devices: $val"
+    else fail "RDMA devices: $val (expected: Configured)"; fi
 
-# fs.weka.rdma_write_support
-val=$(gds_val "weka.rdma_write_support")
-if [[ "$val" == *"true"* ]]; then
-    pass "fs.weka.rdma_write_support: $val"
-else
-    fail "fs.weka.rdma_write_support: $val (expected: true)"
+    status_line=$(gds_val "rdma_device_status")
+    up_count=$(echo "$status_line" | grep -o 'Up: *[0-9]*' | grep -o '[0-9]*' || echo "0")
+    down_count=$(echo "$status_line" | grep -o 'Down: *[0-9]*' | grep -o '[0-9]*' || echo "0")
+    if [[ "$down_count" -eq 0 && "$up_count" -gt 0 ]]; then
+        pass "RDMA device status: Up: $up_count Down: $down_count"
+    elif [[ "$down_count" -gt 0 && "$up_count" -gt 0 ]]; then
+        warn "RDMA device status: Up: $up_count Down: $down_count"
+    else
+        fail "RDMA device status: Up: $up_count Down: $down_count (no devices up)"
+    fi
+
+    val=$(gds_val "use_compat_mode")
+    if [[ "$val" == *"false"* ]]; then pass "use_compat_mode: $val"
+    else fail "use_compat_mode: $val (expected: false)"; fi
+
+    val=$(gds_val "gds_rdma_write_support")
+    if [[ "$val" == *"true"* ]]; then pass "gds_rdma_write_support: $val"
+    else fail "gds_rdma_write_support: $val (expected: true)"; fi
 fi
 
 # Platform verification
@@ -1140,9 +1577,9 @@ run_phase() {
     local i=0
 
     # Build the remote command — use sudo when not connecting as root
-    local remote_cmd="DRY_RUN=${dry_run_val} bash -s"
+    local remote_cmd="DRY_RUN=${dry_run_val} BACKEND_TYPE=${BACKEND_TYPE} bash -s"
     if [[ "$LOCAL_MODE" != true && "$SSH_USER" != "root" ]]; then
-        remote_cmd="sudo DRY_RUN=${dry_run_val} bash -s"
+        remote_cmd="sudo DRY_RUN=${dry_run_val} BACKEND_TYPE=${BACKEND_TYPE} bash -s"
     fi
 
     # Launch all hosts in parallel
@@ -1234,10 +1671,10 @@ run_validate() {
     local -a pids=()
     local i=0
 
-    # Build remote command — use sudo when not root
-    local remote_cmd="bash -s"
+    # Build remote command — use sudo when not root, pass BACKEND_TYPE
+    local remote_cmd="BACKEND_TYPE=${BACKEND_TYPE} bash -s"
     if [[ "$LOCAL_MODE" != true && "$SSH_USER" != "root" ]]; then
-        remote_cmd="sudo bash -s"
+        remote_cmd="sudo BACKEND_TYPE=${BACKEND_TYPE} bash -s"
     fi
 
     for host in "${HOSTS[@]}"; do
@@ -1245,7 +1682,7 @@ run_validate() {
             set +e
             local ec=0 output
             if [[ "$LOCAL_MODE" == true ]]; then
-                output=$(get_validate_script | bash -s 2>&1) || ec=$?
+                output=$(get_validate_script | BACKEND_TYPE="${BACKEND_TYPE}" bash -s 2>&1) || ec=$?
             else
                 output=$(get_validate_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
                     "$remote_cmd" 2>&1) || ec=$?
