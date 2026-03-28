@@ -629,6 +629,29 @@ main_remote() {
         exit 1
     fi
 
+    # Check that GDS (nvidia-fs) is installed
+    local gds_found=false
+    if lsmod | grep -q nvidia_fs; then
+        gds_found=true
+        echo "[INFO]  nvidia_fs kernel module loaded"
+    elif modinfo nvidia_fs &>/dev/null; then
+        gds_found=true
+        echo "[INFO]  nvidia_fs kernel module available (not loaded)"
+    fi
+    if ldconfig -p 2>/dev/null | grep -q libcufile.so; then
+        echo "[INFO]  libcufile.so found"
+    elif [[ -f /usr/local/cuda/lib64/libcufile.so ]] || [[ -f /usr/lib/x86_64-linux-gnu/libcufile.so ]]; then
+        echo "[INFO]  libcufile.so found"
+    else
+        echo "[WARN]  libcufile.so not found — GDS libraries may not be installed"
+        echo "[WARN]  Install with: apt install nvidia-gds or cuda-drivers-gds"
+    fi
+    if [[ "$gds_found" != true ]]; then
+        echo "[ERROR] nvidia_fs kernel module not found — GDS is not installed"
+        echo "[ERROR] Install with: apt install nvidia-gds (or nvidia-fs-dkms)"
+        exit 1
+    fi
+
     # Step 2: GPU detection
     detect_gpu_numa_nodes || exit 1
 
