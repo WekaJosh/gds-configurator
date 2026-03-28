@@ -605,6 +605,49 @@ detect_pkg_manager() {
     fi
 }
 
+detect_cuda_version() {
+    # Detect the installed CUDA major.minor version.
+    # Sets CUDA_VER (e.g. "12-6") in package-name format and
+    # CUDA_VER_DOT (e.g. "12.6") for display.
+    declare -g CUDA_VER="" CUDA_VER_DOT=""
+
+    local ver=""
+
+    # Method 1: nvcc --version (most reliable if in PATH)
+    if command -v nvcc &>/dev/null; then
+        ver=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
+    fi
+
+    # Method 2: /usr/local/cuda/version.json
+    if [[ -z "$ver" && -f /usr/local/cuda/version.json ]]; then
+        ver=$(python3 -c "import json; print(json.load(open('/usr/local/cuda/version.json'))['cuda']['version'])" 2>/dev/null \
+              | grep -oP '^[0-9]+\.[0-9]+')
+    fi
+
+    # Method 3: /usr/local/cuda/version.txt (older CUDA)
+    if [[ -z "$ver" && -f /usr/local/cuda/version.txt ]]; then
+        ver=$(grep -oP '[0-9]+\.[0-9]+' /usr/local/cuda/version.txt | head -1)
+    fi
+
+    # Method 4: dpkg/rpm query for cuda-toolkit package
+    if [[ -z "$ver" ]]; then
+        ver=$(dpkg -l 'cuda-toolkit-*' 2>/dev/null | awk '/^ii/{print $2}' \
+              | grep -oP '[0-9]+-[0-9]+' | head -1 | tr '-' '.')
+    fi
+    if [[ -z "$ver" ]]; then
+        ver=$(rpm -qa 'cuda-toolkit-*' 2>/dev/null \
+              | grep -oP '[0-9]+-[0-9]+' | head -1 | tr '-' '.')
+    fi
+
+    if [[ -n "$ver" ]]; then
+        CUDA_VER_DOT="$ver"
+        CUDA_VER="${ver/./-}"
+        echo "[INFO]  Detected CUDA version: $CUDA_VER_DOT"
+    else
+        echo "[WARN]  Could not detect CUDA version — will install unversioned GDS package"
+    fi
+}
+
 install_gds_packages() {
     detect_pkg_manager
     if [[ -z "$PKG_MGR" ]]; then
@@ -612,29 +655,57 @@ install_gds_packages() {
         return 1
     fi
 
+    detect_cuda_version
+
     echo "[INFO]  Installing GDS packages using $PKG_MGR..."
     case "$PKG_MGR" in
         apt)
-            # Try nvidia-gds first (meta-package), fall back to components
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq 2>/dev/null
-            if apt-get install -y -qq nvidia-gds 2>/dev/null; then
-                echo "[CHANGE] Installed nvidia-gds package"
-            elif apt-get install -y -qq nvidia-fs-dkms libcufile0 2>/dev/null; then
-                echo "[CHANGE] Installed nvidia-fs-dkms + libcufile0"
+            # Try versioned package first (matches installed CUDA), then unversioned
+            if [[ -n "$CUDA_VER" ]]; then
+                echo "[INFO]  Targeting GDS for CUDA $CUDA_VER_DOT"
+                if apt-get install -y -qq "nvidia-gds-${CUDA_VER}" 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds-${CUDA_VER}"
+                elif apt-get install -y -qq nvidia-gds 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds (unversioned fallback)"
+                elif apt-get install -y -qq "nvidia-fs-dkms" "libcufile-${CUDA_VER}" 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-fs-dkms + libcufile-${CUDA_VER}"
+                else
+                    echo "[ERROR] Failed to install GDS packages via apt"
+                    return 1
+                fi
             else
-                echo "[ERROR] Failed to install GDS packages via apt"
-                return 1
+                if apt-get install -y -qq nvidia-gds 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds"
+                elif apt-get install -y -qq nvidia-fs-dkms libcufile0 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-fs-dkms + libcufile0"
+                else
+                    echo "[ERROR] Failed to install GDS packages via apt"
+                    return 1
+                fi
             fi
             ;;
         dnf|yum)
-            if $PKG_MGR install -y nvidia-gds 2>/dev/null; then
-                echo "[CHANGE] Installed nvidia-gds package"
-            elif $PKG_MGR install -y nvidia-fs nvidia-fs-dkms 2>/dev/null; then
-                echo "[CHANGE] Installed nvidia-fs packages"
+            if [[ -n "$CUDA_VER" ]]; then
+                echo "[INFO]  Targeting GDS for CUDA $CUDA_VER_DOT"
+                if $PKG_MGR install -y "nvidia-gds-${CUDA_VER}" 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds-${CUDA_VER}"
+                elif $PKG_MGR install -y nvidia-gds 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds (unversioned fallback)"
+                else
+                    echo "[ERROR] Failed to install GDS packages via $PKG_MGR"
+                    return 1
+                fi
             else
-                echo "[ERROR] Failed to install GDS packages via $PKG_MGR"
-                return 1
+                if $PKG_MGR install -y nvidia-gds 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-gds"
+                elif $PKG_MGR install -y nvidia-fs nvidia-fs-dkms 2>/dev/null; then
+                    echo "[CHANGE] Installed nvidia-fs packages"
+                else
+                    echo "[ERROR] Failed to install GDS packages via $PKG_MGR"
+                    return 1
+                fi
             fi
             ;;
     esac
@@ -650,7 +721,12 @@ ensure_gds_installed() {
     else
         echo "[WARN]  nvidia_fs kernel module not found — GDS is not installed"
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[DRY-RUN] Would install GDS packages"
+            detect_cuda_version
+            if [[ -n "$CUDA_VER" ]]; then
+                echo "[DRY-RUN] Would install GDS packages for CUDA $CUDA_VER_DOT"
+            else
+                echo "[DRY-RUN] Would install GDS packages (unversioned)"
+            fi
         else
             install_gds_packages || exit 1
             # Verify the module is now available after install
