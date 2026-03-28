@@ -593,6 +593,86 @@ PYEOF
 }
 
 # ---- System preparation ----
+detect_pkg_manager() {
+    # Sets PKG_MGR to "apt" or "yum"/"dnf" based on what's available
+    declare -g PKG_MGR=""
+    if command -v apt-get &>/dev/null; then
+        PKG_MGR="apt"
+    elif command -v dnf &>/dev/null; then
+        PKG_MGR="dnf"
+    elif command -v yum &>/dev/null; then
+        PKG_MGR="yum"
+    fi
+}
+
+install_gds_packages() {
+    detect_pkg_manager
+    if [[ -z "$PKG_MGR" ]]; then
+        echo "[ERROR] No supported package manager found (need apt, dnf, or yum)"
+        return 1
+    fi
+
+    echo "[INFO]  Installing GDS packages using $PKG_MGR..."
+    case "$PKG_MGR" in
+        apt)
+            # Try nvidia-gds first (meta-package), fall back to components
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq 2>/dev/null
+            if apt-get install -y -qq nvidia-gds 2>/dev/null; then
+                echo "[CHANGE] Installed nvidia-gds package"
+            elif apt-get install -y -qq nvidia-fs-dkms libcufile0 2>/dev/null; then
+                echo "[CHANGE] Installed nvidia-fs-dkms + libcufile0"
+            else
+                echo "[ERROR] Failed to install GDS packages via apt"
+                return 1
+            fi
+            ;;
+        dnf|yum)
+            if $PKG_MGR install -y nvidia-gds 2>/dev/null; then
+                echo "[CHANGE] Installed nvidia-gds package"
+            elif $PKG_MGR install -y nvidia-fs nvidia-fs-dkms 2>/dev/null; then
+                echo "[CHANGE] Installed nvidia-fs packages"
+            else
+                echo "[ERROR] Failed to install GDS packages via $PKG_MGR"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+ensure_gds_installed() {
+    # Check if nvidia_fs kernel module is available
+    if lsmod | grep -q nvidia_fs; then
+        echo "[INFO]  nvidia_fs kernel module loaded"
+    elif modinfo nvidia_fs &>/dev/null; then
+        echo "[INFO]  nvidia_fs kernel module available (not loaded)"
+    else
+        echo "[WARN]  nvidia_fs kernel module not found — GDS is not installed"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY-RUN] Would install GDS packages"
+        else
+            install_gds_packages || exit 1
+            # Verify the module is now available after install
+            if ! modinfo nvidia_fs &>/dev/null; then
+                echo "[ERROR] nvidia_fs module still not available after install"
+                echo "[ERROR] A DKMS build may have failed — check dkms status"
+                exit 1
+            fi
+            echo "[INFO]  nvidia_fs module now available"
+        fi
+    fi
+
+    # Check for libcufile.so (non-fatal, but warn)
+    if ldconfig -p 2>/dev/null | grep -q libcufile.so; then
+        echo "[INFO]  libcufile.so found"
+    elif [[ -f /usr/local/cuda/lib64/libcufile.so ]] || [[ -f /usr/lib/x86_64-linux-gnu/libcufile.so ]]; then
+        echo "[INFO]  libcufile.so found"
+    else
+        echo "[WARN]  libcufile.so not found — applications may fail to use GDS"
+    fi
+}
+
 ensure_nvidia_peermem() {
     # nvidia_peermem (or nvidia-peermem) is required for GDS RDMA.
     # It enables GPU peer memory access for RDMA NICs.
@@ -629,28 +709,8 @@ main_remote() {
         exit 1
     fi
 
-    # Check that GDS (nvidia-fs) is installed
-    local gds_found=false
-    if lsmod | grep -q nvidia_fs; then
-        gds_found=true
-        echo "[INFO]  nvidia_fs kernel module loaded"
-    elif modinfo nvidia_fs &>/dev/null; then
-        gds_found=true
-        echo "[INFO]  nvidia_fs kernel module available (not loaded)"
-    fi
-    if ldconfig -p 2>/dev/null | grep -q libcufile.so; then
-        echo "[INFO]  libcufile.so found"
-    elif [[ -f /usr/local/cuda/lib64/libcufile.so ]] || [[ -f /usr/lib/x86_64-linux-gnu/libcufile.so ]]; then
-        echo "[INFO]  libcufile.so found"
-    else
-        echo "[WARN]  libcufile.so not found — GDS libraries may not be installed"
-        echo "[WARN]  Install with: apt install nvidia-gds or cuda-drivers-gds"
-    fi
-    if [[ "$gds_found" != true ]]; then
-        echo "[ERROR] nvidia_fs kernel module not found — GDS is not installed"
-        echo "[ERROR] Install with: apt install nvidia-gds (or nvidia-fs-dkms)"
-        exit 1
-    fi
+    # Check that GDS (nvidia-fs) is installed; install if missing
+    ensure_gds_installed
 
     # Step 2: GPU detection
     detect_gpu_numa_nodes || exit 1
