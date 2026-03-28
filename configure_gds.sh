@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # configure_gds.sh — Configure NVIDIA GDS rdma_dev_addr_list on remote hosts for WEKA access
 #
-# Usage: configure_gds.sh <ip_file> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+# Usage: configure_gds.sh <ip_file|ip [ip ...]> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 #
-#   ip_file   File containing one IP address per line (blank lines and # comments ignored)
+#   ip_file       File containing one IP address per line (blank lines and # comments ignored)
+#   ip [ip ...]   One or more IP addresses/hostnames passed directly on the command line
 #   -u user   SSH username (default: root)
 #   -k file   SSH private key file
 #   -p port   SSH port (default: 22)
@@ -43,15 +44,22 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
 
 usage() {
     cat <<EOF
-Usage: $0 <ip_file> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+Usage: $0 <ip_file|ip [ip ...]> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 
-  ip_file   File with one IP address per line (# comments and blank lines ok)
+  ip_file       File with one IP address per line (# comments and blank lines ok)
+  ip [ip ...]   One or more IP addresses/hostnames passed directly
+
   -u user   SSH username            (default: root)
   -k file   SSH private key file
   -p port   SSH port                (default: 22)
   -d        Dry-run (no writes)
   -v        Verbose (show [INFO] lines)
   -f        Skip confirmation prompt
+
+Examples:
+  $0 hosts.txt
+  $0 10.0.0.1 10.0.0.2 10.0.0.3 -u admin -k ~/.ssh/id_rsa
+  $0 hosts.txt 10.0.0.99 -d -v
 
 Version: $SCRIPT_VERSION
 EOF
@@ -62,13 +70,24 @@ EOF
 # Argument parsing
 # ---------------------------------------------------------------------------
 parse_args() {
-    # ip_file must be the first positional argument
-    if [[ $# -lt 1 || "$1" == -* ]]; then
-        err "First argument must be the IP file."
+    if [[ $# -lt 1 ]]; then
+        err "At least one IP address or an IP file is required."
         usage
     fi
-    IP_FILE="$1"
-    shift
+
+    # Collect all positional arguments (before and between flags) as potential
+    # IPs or a file. getopts stops at the first flag, so we process positionals
+    # manually first, then hand off to getopts for flags.
+    declare -ga RAW_TARGETS=()
+    while [[ $# -gt 0 && "$1" != -* ]]; do
+        RAW_TARGETS+=("$1")
+        shift
+    done
+
+    if [[ ${#RAW_TARGETS[@]} -eq 0 ]]; then
+        err "At least one IP address or an IP file is required."
+        usage
+    fi
 
     while getopts ":u:k:p:dvf" opt; do
         case "$opt" in
@@ -84,27 +103,38 @@ parse_args() {
     done
 }
 
+add_host() {
+    local h="$1"
+    h="${h#"${h%%[![:space:]]*}"}"   # strip leading whitespace
+    h="${h%"${h##*[![:space:]]}"}"   # strip trailing whitespace
+    [[ -z "$h" || "$h" == \#* ]] && return
+    HOSTS+=("$h")
+}
+
 validate_inputs() {
-    if [[ ! -f "$IP_FILE" ]]; then
-        err "IP file not found: $IP_FILE"
-        exit 1
-    fi
     if [[ -n "$SSH_KEYFILE" && ! -f "$SSH_KEYFILE" ]]; then
         err "Key file not found: $SSH_KEYFILE"
         exit 1
     fi
 
-    # Read IPs, stripping blanks and comments
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # strip leading/trailing whitespace
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        HOSTS+=("$line")
-    done < "$IP_FILE"
+    # Each RAW_TARGET is either a file path or an IP/hostname.
+    # If exactly one target and it's a readable file, treat it as an IP file.
+    # Otherwise treat all targets as inline IPs/hostnames (a mix is also allowed:
+    # any target that is a readable file gets expanded; others are used directly).
+    local target
+    for target in "${RAW_TARGETS[@]}"; do
+        if [[ -f "$target" ]]; then
+            # Expand file into hosts
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                add_host "$line"
+            done < "$target"
+        else
+            add_host "$target"
+        fi
+    done
 
     if [[ ${#HOSTS[@]} -eq 0 ]]; then
-        err "No valid IP addresses found in $IP_FILE"
+        err "No valid IP addresses or hostnames found."
         exit 1
     fi
 }
