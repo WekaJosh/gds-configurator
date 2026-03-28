@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# configure_gds.sh — Configure NVIDIA GDS rdma_dev_addr_list on remote hosts for WEKA access
+# configure_gds.sh — Configure NVIDIA GDS rdma_dev_addr_list for WEKA access
 #
-# Usage: configure_gds.sh <ip_file|ip [ip ...]> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+# Usage: configure_gds.sh [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 #
+#   -l            Run on the local system (no SSH)
 #   ip_file       File containing one IP address per line (blank lines and # comments ignored)
 #   ip [ip ...]   One or more IP addresses/hostnames passed directly on the command line
 #   -u user   SSH username (default: root)
@@ -30,6 +31,7 @@ SSH_KEYFILE=""
 DRY_RUN=false
 VERBOSE=false
 FORCE=false
+LOCAL_MODE=false
 
 declare -a HOSTS=()
 declare -A HOST_STATUS=()   # host -> SUCCESS | FAILED | SKIPPED
@@ -43,8 +45,9 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
 
 usage() {
     cat <<EOF
-Usage: $0 <ip_file|ip [ip ...]> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+Usage: $0 [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 
+  -l            Run on the local system (no SSH, no hosts needed)
   ip_file       File with one IP address per line (# comments and blank lines ok)
   ip [ip ...]   One or more IP addresses/hostnames passed directly
 
@@ -56,9 +59,11 @@ Usage: $0 <ip_file|ip [ip ...]> [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
   -f        Skip confirmation prompt
 
 Examples:
-  $0 hosts.txt
-  $0 10.0.0.1 10.0.0.2 10.0.0.3 -u admin -k ~/.ssh/id_rsa
-  $0 hosts.txt 10.0.0.99 -d -v
+  $0 -l                          # configure the local system
+  $0 -l -d -v                    # local dry-run with verbose output
+  $0 hosts.txt                   # configure remote hosts from file
+  $0 10.0.0.1 10.0.0.2 -u admin  # configure remote hosts inline
+  $0 hosts.txt 10.0.0.99 -d -v   # mixed file + inline, dry-run
 
 Version: $SCRIPT_VERSION
 EOF
@@ -69,27 +74,27 @@ EOF
 # Argument parsing
 # ---------------------------------------------------------------------------
 parse_args() {
-    if [[ $# -lt 1 ]]; then
-        err "At least one IP address or an IP file is required."
-        usage
-    fi
+    # Pre-scan for -l flag so we know whether positional args are required.
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == "-l" ]] && LOCAL_MODE=true
+    done
 
-    # Collect all positional arguments (before and between flags) as potential
-    # IPs or a file. getopts stops at the first flag, so we process positionals
-    # manually first, then hand off to getopts for flags.
+    # Collect positional arguments (before flags).
     declare -ga RAW_TARGETS=()
     while [[ $# -gt 0 && "$1" != -* ]]; do
         RAW_TARGETS+=("$1")
         shift
     done
 
-    if [[ ${#RAW_TARGETS[@]} -eq 0 ]]; then
-        err "At least one IP address or an IP file is required."
+    # In remote mode, at least one host or file is required.
+    if [[ "$LOCAL_MODE" != true && ${#RAW_TARGETS[@]} -eq 0 ]]; then
+        err "At least one IP address, an IP file, or -l (local) is required."
         usage
     fi
 
     OPTIND=1
-    while getopts ":u:k:p:dvf" opt; do
+    while getopts ":u:k:p:dvfl" opt; do
         case "$opt" in
             u) SSH_USER="$OPTARG" ;;
             k) SSH_KEYFILE="$OPTARG" ;;
@@ -97,10 +102,16 @@ parse_args() {
             d) DRY_RUN=true ;;
             v) VERBOSE=true ;;
             f) FORCE=true ;;
+            l) LOCAL_MODE=true ;;
             :) err "Option -$OPTARG requires an argument."; usage ;;
             \?) err "Unknown option: -$OPTARG"; usage ;;
         esac
     done
+
+    # Warn if hosts were provided alongside -l
+    if [[ "$LOCAL_MODE" == true && ${#RAW_TARGETS[@]} -gt 0 ]]; then
+        err "Warning: -l (local mode) ignores any hosts/files provided."
+    fi
 }
 
 add_host() {
@@ -112,6 +123,11 @@ add_host() {
 }
 
 validate_inputs() {
+    if [[ "$LOCAL_MODE" == true ]]; then
+        HOSTS=("localhost")
+        return
+    fi
+
     if [[ -n "$SSH_KEYFILE" && ! -f "$SSH_KEYFILE" ]]; then
         err "Key file not found: $SSH_KEYFILE"
         exit 1
@@ -155,10 +171,14 @@ confirm_execution() {
 
     echo ""
     echo "=== GDS Configuration Script v${SCRIPT_VERSION} ==="
-    echo "  Hosts:    ${#HOSTS[@]}"
-    echo "  User:     $SSH_USER"
-    echo "  Port:     $SSH_PORT"
-    [[ -n "$SSH_KEYFILE" ]] && echo "  Key:      $SSH_KEYFILE"
+    if [[ "$LOCAL_MODE" == true ]]; then
+        echo "  Mode:     LOCAL"
+    else
+        echo "  Hosts:    ${#HOSTS[@]}"
+        echo "  User:     $SSH_USER"
+        echo "  Port:     $SSH_PORT"
+        [[ -n "$SSH_KEYFILE" ]] && echo "  Key:      $SSH_KEYFILE"
+    fi
     echo "  Dry-run:  $DRY_RUN"
     echo ""
     read -r -p "Proceed? [y/N] " answer
@@ -170,25 +190,10 @@ confirm_execution() {
 }
 
 # ---------------------------------------------------------------------------
-# Per-host runner
+# Remote script body (emitted by get_remote_script, executed on target host)
 # ---------------------------------------------------------------------------
-run_remote() {
-    local host="$1"
-    local exit_code=0
-
-    echo "[$host] Connecting..."
-
-    # The heredoc uses a single-quoted delimiter so variables inside are NOT
-    # expanded by the local shell. DRY_RUN and VERBOSE are passed as env vars
-    # prefixed to the bash command.
-    local output
-    output=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
-        "DRY_RUN=${DRY_RUN} VERBOSE=${VERBOSE} bash -s" <<'REMOTE_SCRIPT' 2>&1) \
-        || exit_code=$?
-
-# ============================================================
-# BEGIN REMOTE SCRIPT (runs on the remote host)
-# ============================================================
+get_remote_script() {
+    cat <<'REMOTE_SCRIPT'
 
 detect_gpu_numa_nodes() {
     # Returns associative array GPU_NUMA_NODES[bus_id]=numa and
@@ -538,6 +543,29 @@ main_remote() {
 main_remote
 
 REMOTE_SCRIPT
+}
+
+# ---------------------------------------------------------------------------
+# Per-host runner (dispatches to local bash or SSH)
+# ---------------------------------------------------------------------------
+run_on_host() {
+    local host="$1"
+    local exit_code=0
+    local label="$host"
+
+    if [[ "$LOCAL_MODE" == true ]]; then
+        label="local"
+        echo "[$label] Running..."
+        local output
+        output=$(get_remote_script | DRY_RUN=${DRY_RUN} VERBOSE=${VERBOSE} bash -s 2>&1) \
+            || exit_code=$?
+    else
+        echo "[$label] Connecting..."
+        local output
+        output=$(get_remote_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
+            "DRY_RUN=${DRY_RUN} VERBOSE=${VERBOSE} bash -s" 2>&1) \
+            || exit_code=$?
+    fi
 
     # Process captured output.
     # For failed hosts, always show all output so the user can see why.
@@ -548,25 +576,25 @@ REMOTE_SCRIPT
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         if [[ "$VERBOSE" == true || "$show_all" == true ]]; then
-            echo "[$host] $line"
+            echo "[$label] $line"
         elif [[ "$line" == *"[ERROR]"* || "$line" == *"[WARN]"* || \
                 "$line" == *"[CHANGE]"* || "$line" == *"[DRY-RUN]"* ]]; then
-            echo "[$host] $line"
+            echo "[$label] $line"
         fi
     done <<< "$output"
 
-    if [[ $exit_code -eq 255 ]]; then
+    if [[ "$LOCAL_MODE" != true && $exit_code -eq 255 ]]; then
         HOST_STATUS["$host"]="FAILED"
         HOST_MESSAGE["$host"]="SSH connection failed (exit 255)"
-        echo "[$host] FAILED (SSH connection)"
+        echo "[$label] FAILED (SSH connection)"
     elif [[ $exit_code -ne 0 ]]; then
         HOST_STATUS["$host"]="FAILED"
-        HOST_MESSAGE["$host"]="Remote script exited with code $exit_code"
-        echo "[$host] FAILED (remote exit $exit_code)"
+        HOST_MESSAGE["$host"]="Script exited with code $exit_code"
+        echo "[$label] FAILED (exit $exit_code)"
     else
         HOST_STATUS["$host"]="SUCCESS"
         HOST_MESSAGE["$host"]="OK"
-        echo "[$host] SUCCESS"
+        echo "[$label] SUCCESS"
     fi
     echo ""
 }
@@ -607,14 +635,18 @@ print_summary() {
 main() {
     parse_args "$@"
     validate_inputs
-    build_ssh_opts
+    [[ "$LOCAL_MODE" != true ]] && build_ssh_opts
     confirm_execution
 
-    log "Starting GDS configuration for ${#HOSTS[@]} host(s)..."
+    if [[ "$LOCAL_MODE" == true ]]; then
+        log "Running GDS configuration locally..."
+    else
+        log "Starting GDS configuration for ${#HOSTS[@]} host(s)..."
+    fi
     echo ""
 
     for host in "${HOSTS[@]}"; do
-        run_remote "$host"
+        run_on_host "$host"
     done
 
     print_summary
