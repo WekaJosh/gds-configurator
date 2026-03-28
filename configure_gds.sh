@@ -342,6 +342,48 @@ find_gpu_resident_devs() {
     echo "[INFO]  GPU-resident mlx5 devices: ${GPU_RESIDENT_DEVS[*]}"
 }
 
+resolve_rdma_addresses() {
+    # Resolve GPU-resident mlx device names to their IP addresses.
+    # cufile.json rdma_dev_addr_list requires IPs for user-space RDMA (WEKA).
+    # Only devices with an assigned IPv4 address are included.
+    declare -ga RDMA_ADDR_LIST=()
+
+    local dev_name
+    for dev_name in "${GPU_RESIDENT_DEVS[@]}"; do
+        # Find the network interface(s) for this IB device via sysfs
+        local net_dir="/sys/class/infiniband/${dev_name}/device/net"
+        if [[ ! -d "$net_dir" ]]; then
+            echo "[WARN]  $dev_name: no network interface found in sysfs, skipping"
+            continue
+        fi
+
+        local iface
+        for iface in "$net_dir"/*/; do
+            [[ -d "$iface" ]] || continue
+            iface=$(basename "$iface")
+
+            # Get IPv4 addresses on this interface
+            local ip
+            ip=$(ip -4 -o addr show dev "$iface" 2>/dev/null \
+                 | awk '{print $4}' | cut -d/ -f1 | head -1)
+
+            if [[ -n "$ip" ]]; then
+                RDMA_ADDR_LIST+=("$ip")
+                echo "[INFO]  $dev_name -> $iface -> $ip"
+            else
+                echo "[INFO]  $dev_name -> $iface (no IPv4 address, skipping)"
+            fi
+        done
+    done
+
+    if [[ ${#RDMA_ADDR_LIST[@]} -eq 0 ]]; then
+        echo "[WARN]  No GPU-resident mlx5 devices have IPv4 addresses assigned"
+        echo "[WARN]  rdma_dev_addr_list will be empty — assign IPs to data plane interfaces"
+        return 0
+    fi
+    echo "[INFO]  RDMA addresses for cufile.json: ${RDMA_ADDR_LIST[*]}"
+}
+
 strip_json_comments() {
     # cufile.json ships with C-style // comments which are not valid JSON.
     # Strip them in-place before any JSON tool processes the file.
@@ -443,7 +485,7 @@ merge_and_write() {
 
     if command -v python3 &>/dev/null; then
         JSON_TOOL="python3"
-        NEW_JSON=$(python3 - "$TMPJSON" "${GPU_RESIDENT_DEVS[@]}" <<'PYEOF'
+        NEW_JSON=$(python3 - "$TMPJSON" ${RDMA_ADDR_LIST[@]+"${RDMA_ADDR_LIST[@]}"} <<'PYEOF'
 import json, sys
 
 tmpfile = sys.argv[1]
@@ -509,7 +551,7 @@ PYEOF
         devs_json="["
         local first=true
         local d
-        for d in "${GPU_RESIDENT_DEVS[@]}"; do
+        for d in ${RDMA_ADDR_LIST[@]+"${RDMA_ADDR_LIST[@]}"}; do
             [[ "$first" == true ]] || devs_json+=","
             devs_json+="\"${d}\""
             first=false
@@ -784,6 +826,58 @@ ensure_nvidia_peermem() {
     fi
 }
 
+ensure_rdma_library() {
+    # libcufile_rdma.so must be findable by the linker for GDS RDMA to work.
+    if ldconfig -p 2>/dev/null | grep -q libcufile_rdma.so; then
+        echo "[INFO]  libcufile_rdma.so found in linker cache"
+        return 0
+    fi
+
+    # Check common CUDA library paths
+    local rdma_lib=""
+    local search_paths=(
+        /usr/local/cuda/lib64
+        /usr/local/cuda/targets/x86_64-linux/lib
+        /usr/lib/x86_64-linux-gnu
+    )
+    local p
+    for p in "${search_paths[@]}"; do
+        if [[ -f "${p}/libcufile_rdma.so" ]]; then
+            rdma_lib="${p}/libcufile_rdma.so"
+            break
+        fi
+        # Also check for versioned variants (libcufile_rdma.so.1.x.x)
+        local match
+        match=$(ls "${p}"/libcufile_rdma.so* 2>/dev/null | head -1)
+        if [[ -n "$match" ]]; then
+            rdma_lib="$match"
+            break
+        fi
+    done
+
+    if [[ -z "$rdma_lib" ]]; then
+        echo "[WARN]  libcufile_rdma.so not found — GDS RDMA transfers will not work"
+        echo "[WARN]  It should be part of the GDS/CUDA packages"
+        return 0
+    fi
+
+    local lib_dir
+    lib_dir=$(dirname "$rdma_lib")
+    echo "[INFO]  Found $rdma_lib"
+
+    # Ensure the directory is in the linker path
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would add $lib_dir to /etc/ld.so.conf.d/ and run ldconfig"
+        return 0
+    fi
+
+    if [[ ! -f /etc/ld.so.conf.d/cuda-gds.conf ]] || ! grep -q "$lib_dir" /etc/ld.so.conf.d/cuda-gds.conf 2>/dev/null; then
+        echo "$lib_dir" >> /etc/ld.so.conf.d/cuda-gds.conf
+        ldconfig 2>/dev/null
+        echo "[CHANGE] Added $lib_dir to linker path and ran ldconfig"
+    fi
+}
+
 # ---- Main remote execution ----
 main_remote() {
     # Step 1: Prerequisites
@@ -811,13 +905,19 @@ main_remote() {
         exit 0
     fi
 
-    # Step 5: Ensure nvidia_peermem is loaded (required for GDS RDMA)
+    # Step 5: Resolve mlx devices to IP addresses for rdma_dev_addr_list
+    resolve_rdma_addresses
+
+    # Step 6: Ensure nvidia_peermem is loaded (required for GDS RDMA)
     ensure_nvidia_peermem
 
-    # Step 6: Read/create cufile.json
+    # Step 7: Ensure libcufile_rdma.so is findable
+    ensure_rdma_library
+
+    # Step 8: Read/create cufile.json
     read_or_create_cufile
 
-    # Step 7 & 8: Merge and write
+    # Step 9: Merge and write
     merge_and_write || exit 1
 
     exit 0
