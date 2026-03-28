@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# configure_gds.sh — Configure NVIDIA GDS rdma_dev_addr_list for WEKA access
+# configure_gds.sh — Configure and validate NVIDIA GDS for WEKA access
 #
-# Usage: configure_gds.sh [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+# Usage: configure_gds.sh [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 #
 #   -l            Run on the local system (no SSH)
+#   -c            Validate: check GDS configuration and parse gdscheck -p output
 #   ip_file       File containing one IP address per line (blank lines and # comments ignored)
 #   ip [ip ...]   One or more IP addresses/hostnames passed directly on the command line
 #   -u user   SSH username (default: root)
@@ -32,6 +33,7 @@ DRY_RUN=false
 VERBOSE=false
 FORCE=false
 LOCAL_MODE=false
+VALIDATE_MODE=false
 
 declare -a HOSTS=()
 declare -A HOST_STATUS=()   # host -> SUCCESS | FAILED | SKIPPED
@@ -45,9 +47,10 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
 
 usage() {
     cat <<EOF
-Usage: $0 [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+Usage: $0 [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 
   -l            Run on the local system (no SSH, no hosts needed)
+  -c            Validate: check GDS config and run gdscheck -p
   ip_file       File with one IP address per line (# comments and blank lines ok)
   ip [ip ...]   One or more IP addresses/hostnames passed directly
 
@@ -60,7 +63,9 @@ Usage: $0 [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 
 Examples:
   $0 -l                          # configure the local system
+  $0 -l -c                       # validate the local system
   $0 -l -d -v                    # local dry-run with verbose output
+  $0 hosts.txt -u ubuntu -c      # validate remote hosts
   $0 hosts.txt                   # configure remote hosts from file
   $0 10.0.0.1 10.0.0.2 -u admin  # configure remote hosts inline
   $0 hosts.txt 10.0.0.99 -d -v   # mixed file + inline, dry-run
@@ -74,10 +79,11 @@ EOF
 # Argument parsing
 # ---------------------------------------------------------------------------
 parse_args() {
-    # Pre-scan for -l flag so we know whether positional args are required.
+    # Pre-scan for -l and -c flags so we know whether positional args are required.
     local arg
     for arg in "$@"; do
         [[ "$arg" == "-l" ]] && LOCAL_MODE=true
+        [[ "$arg" == "-c" ]] && VALIDATE_MODE=true
     done
 
     # Collect positional arguments (before flags).
@@ -94,7 +100,7 @@ parse_args() {
     fi
 
     OPTIND=1
-    while getopts ":u:k:p:dvfl" opt; do
+    while getopts ":u:k:p:dvflc" opt; do
         case "$opt" in
             u) SSH_USER="$OPTARG" ;;
             k) SSH_KEYFILE="$OPTARG" ;;
@@ -103,6 +109,7 @@ parse_args() {
             v) VERBOSE=true ;;
             f) FORCE=true ;;
             l) LOCAL_MODE=true ;;
+            c) VALIDATE_MODE=true ;;
             :) err "Option -$OPTARG requires an argument."; usage ;;
             \?) err "Unknown option: -$OPTARG"; usage ;;
         esac
@@ -935,6 +942,191 @@ REMOTE_SCRIPT
 }
 
 # ---------------------------------------------------------------------------
+# Validation script body (emitted by get_validate_script)
+# ---------------------------------------------------------------------------
+get_validate_script() {
+    cat <<'VALIDATE_SCRIPT'
+
+HAS_FAIL=false
+
+pass() { echo "[PASS]  $*"; }
+fail() { echo "[FAIL]  $*"; HAS_FAIL=true; }
+warn() { echo "[WARN]  $*"; }
+info() { echo "[INFO]  $*"; }
+
+# --- System checks ---
+echo "=== System Checks ==="
+
+# nvidia_fs module
+if lsmod | grep -q nvidia_fs; then
+    pass "nvidia_fs module: loaded"
+else
+    fail "nvidia_fs module: not loaded"
+fi
+
+# nvidia_peermem module
+if lsmod | grep -q nvidia_peermem; then
+    pass "nvidia_peermem module: loaded"
+else
+    fail "nvidia_peermem module: not loaded"
+fi
+
+# libcufile_rdma.so
+if ldconfig -p 2>/dev/null | grep -q libcufile_rdma.so; then
+    pass "libcufile_rdma.so: found in linker cache"
+else
+    fail "libcufile_rdma.so: not in linker cache"
+fi
+
+# /etc/cufile.json exists
+if [[ -f /etc/cufile.json ]]; then
+    pass "/etc/cufile.json: exists"
+else
+    fail "/etc/cufile.json: missing"
+fi
+
+echo ""
+
+# --- gdscheck -p ---
+GDSCHECK=""
+for candidate in \
+    /usr/local/cuda/gds/tools/gdscheck \
+    /usr/local/cuda/tools/gdscheck \
+    $(command -v gdscheck 2>/dev/null || true); do
+    if [[ -x "$candidate" ]]; then
+        GDSCHECK="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$GDSCHECK" ]]; then
+    fail "gdscheck: not found (checked /usr/local/cuda/gds/tools/ and PATH)"
+    if [[ "$HAS_FAIL" == true ]]; then exit 1; else exit 0; fi
+fi
+
+info "Running: $GDSCHECK -p"
+echo ""
+
+GDS_OUTPUT=$("$GDSCHECK" -p 2>&1) || true
+
+echo "=== GDS Validation ==="
+
+# Helper: extract a value from gdscheck output
+gds_val() {
+    local pattern="$1"
+    echo "$GDS_OUTPUT" | grep -i "$pattern" | head -1 | sed 's/^.*: *//'
+}
+
+# WekaFS
+val=$(gds_val "WekaFS")
+if [[ "$val" == *"Supported"* ]]; then
+    pass "WekaFS: $val"
+else
+    fail "WekaFS: $val (expected: Supported)"
+fi
+
+# Userspace RDMA
+val=$(gds_val "Userspace RDMA")
+if [[ "$val" == *"Supported"* ]]; then
+    pass "Userspace RDMA: $val"
+else
+    fail "Userspace RDMA: $val (expected: Supported)"
+fi
+
+# Mellanox PeerDirect
+val=$(gds_val "Mellanox PeerDirect")
+if [[ "$val" == *"Enabled"* ]]; then
+    pass "Mellanox PeerDirect: $val"
+else
+    fail "Mellanox PeerDirect: $val (expected: Enabled)"
+fi
+
+# RDMA library
+val=$(gds_val "rdma library")
+if [[ "$val" == *"Loaded"* ]]; then
+    pass "RDMA library: $val"
+else
+    fail "RDMA library: $val (expected: Loaded)"
+fi
+
+# RDMA devices
+val=$(gds_val "rdma devices")
+if [[ "$val" == *"Configured"* ]]; then
+    pass "RDMA devices: $val"
+else
+    fail "RDMA devices: $val (expected: Configured)"
+fi
+
+# RDMA device status — extract Up/Down counts
+status_line=$(gds_val "rdma_device_status")
+up_count=$(echo "$status_line" | grep -oP 'Up:\s*\K[0-9]+' || echo "0")
+down_count=$(echo "$status_line" | grep -oP 'Down:\s*\K[0-9]+' || echo "0")
+if [[ "$down_count" -eq 0 && "$up_count" -gt 0 ]]; then
+    pass "RDMA device status: Up: $up_count Down: $down_count"
+elif [[ "$down_count" -gt 0 && "$up_count" -gt 0 ]]; then
+    warn "RDMA device status: Up: $up_count Down: $down_count"
+else
+    fail "RDMA device status: Up: $up_count Down: $down_count (no devices up)"
+fi
+
+# use_compat_mode
+val=$(gds_val "use_compat_mode")
+if [[ "$val" == *"false"* ]]; then
+    pass "use_compat_mode: $val"
+else
+    fail "use_compat_mode: $val (expected: false)"
+fi
+
+# gds_rdma_write_support
+val=$(gds_val "gds_rdma_write_support")
+if [[ "$val" == *"true"* ]]; then
+    pass "gds_rdma_write_support: $val"
+else
+    fail "gds_rdma_write_support: $val (expected: true)"
+fi
+
+# fs.weka.rdma_write_support
+val=$(gds_val "weka.rdma_write_support")
+if [[ "$val" == *"true"* ]]; then
+    pass "fs.weka.rdma_write_support: $val"
+else
+    fail "fs.weka.rdma_write_support: $val (expected: true)"
+fi
+
+# Platform verification
+platform_line=$(echo "$GDS_OUTPUT" | grep -i "Platform verification" | tail -1)
+if [[ "$platform_line" == *"succeeded"* ]]; then
+    pass "Platform verification: succeeded"
+else
+    fail "Platform verification: failed"
+fi
+
+# GPU GDS support
+echo ""
+echo "=== GPU Status ==="
+gpu_count=$(echo "$GDS_OUTPUT" | grep -c "supports GDS" || true)
+gpu_total=$(echo "$GDS_OUTPUT" | grep -c "GPU index" || true)
+if [[ "$gpu_total" -eq 0 ]]; then
+    fail "No GPUs detected"
+elif [[ "$gpu_count" -eq "$gpu_total" ]]; then
+    pass "All $gpu_total GPU(s) support GDS"
+else
+    warn "Only $gpu_count / $gpu_total GPU(s) support GDS"
+fi
+
+echo ""
+if [[ "$HAS_FAIL" == true ]]; then
+    echo "RESULT: FAIL — one or more checks failed"
+    exit 1
+else
+    echo "RESULT: PASS — GDS is properly configured"
+    exit 0
+fi
+
+VALIDATE_SCRIPT
+}
+
+# ---------------------------------------------------------------------------
 # Parallel phase runner
 # ---------------------------------------------------------------------------
 run_phase() {
@@ -1033,6 +1225,108 @@ run_phase() {
 }
 
 # ---------------------------------------------------------------------------
+# Validation runner — parallel, uses get_validate_script
+# ---------------------------------------------------------------------------
+run_validate() {
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/gds_validate.XXXXXX)
+    local -a pids=()
+    local i=0
+
+    # Build remote command — use sudo when not root
+    local remote_cmd="bash -s"
+    if [[ "$LOCAL_MODE" != true && "$SSH_USER" != "root" ]]; then
+        remote_cmd="sudo bash -s"
+    fi
+
+    for host in "${HOSTS[@]}"; do
+        (
+            set +e
+            local ec=0 output
+            if [[ "$LOCAL_MODE" == true ]]; then
+                output=$(get_validate_script | bash -s 2>&1) || ec=$?
+            else
+                output=$(get_validate_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
+                    "$remote_cmd" 2>&1) || ec=$?
+            fi
+            printf '%s\n' "$output" > "$tmpdir/${i}.out"
+            echo "$ec" > "$tmpdir/${i}.exit"
+        ) &
+        pids+=($!)
+        i=$(( i + 1 ))
+    done
+
+    wait "${pids[@]}" 2>/dev/null || true
+
+    # Display results
+    i=0
+    for host in "${HOSTS[@]}"; do
+        local label="$host"
+        if [[ "$LOCAL_MODE" == true ]]; then label="local"; fi
+
+        local output exit_code
+        output=$(cat "$tmpdir/${i}.out" 2>/dev/null || echo "")
+        exit_code=$(cat "$tmpdir/${i}.exit" 2>/dev/null || echo "1")
+
+        echo "========== [$label] =========="
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$VERBOSE" == true ]]; then
+                echo "  $line"
+            elif [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* || \
+                    "$line" == *"[WARN]"* || "$line" == *"RESULT:"* || \
+                    "$line" == "==="* ]]; then
+                echo "  $line"
+            fi
+        done <<< "$output"
+
+        if [[ "$LOCAL_MODE" != true && "$exit_code" == "255" ]]; then
+            HOST_STATUS["$host"]="FAILED"
+            HOST_MESSAGE["$host"]="SSH connection failed (exit 255)"
+        elif [[ "$exit_code" != "0" ]]; then
+            HOST_STATUS["$host"]="FAILED"
+            HOST_MESSAGE["$host"]="Validation failed"
+        else
+            HOST_STATUS["$host"]="OK"
+            HOST_MESSAGE["$host"]="All checks passed"
+        fi
+        echo ""
+
+        i=$(( i + 1 ))
+    done
+
+    rm -rf "$tmpdir"
+}
+
+print_validate_summary() {
+    local total=${#HOSTS[@]}
+    local passed=0 failed=0
+
+    for host in "${HOSTS[@]}"; do
+        case "${HOST_STATUS[$host]:-UNKNOWN}" in
+            OK)     passed=$(( passed + 1 )) ;;
+            FAILED) failed=$(( failed + 1 )) ;;
+        esac
+    done
+
+    echo "=== Validation Summary ==="
+    echo "Passed:  $passed / $total"
+    echo "Failed:  $failed"
+
+    if [[ $failed -gt 0 ]]; then
+        echo ""
+        echo "FAILED hosts:"
+        for host in "${HOSTS[@]}"; do
+            if [[ "${HOST_STATUS[$host]:-}" == "FAILED" ]]; then
+                echo "  $host  ->  ${HOST_MESSAGE[$host]}"
+            fi
+        done
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 print_summary() {
@@ -1072,6 +1366,28 @@ main() {
     validate_inputs
     if [[ "$LOCAL_MODE" != true ]]; then
         build_ssh_opts
+    fi
+
+    # Validate mode — run checks and exit
+    if [[ "$VALIDATE_MODE" == true ]]; then
+        if [[ "$LOCAL_MODE" == true ]]; then
+            log "Validating GDS configuration on local system..."
+        else
+            log "Validating GDS configuration on ${#HOSTS[@]} host(s) in parallel..."
+        fi
+        echo ""
+
+        run_validate
+        print_validate_summary
+
+        # Exit with failure if any host failed validation
+        local vfail
+        for vfail in "${HOSTS[@]}"; do
+            if [[ "${HOST_STATUS[$vfail]:-}" == "FAILED" ]]; then
+                return 1
+            fi
+        done
+        return 0
     fi
 
     # Phase 1: Plan — dry-run all hosts in parallel to discover changes

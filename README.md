@@ -28,7 +28,7 @@ On each host it:
 ## Usage
 
 ```
-configure_gds.sh [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
+configure_gds.sh [-l] [-c] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v] [-f]
 ```
 
 ### Options
@@ -36,6 +36,7 @@ configure_gds.sh [-l] [ip_file|ip ...] [-u user] [-k keyfile] [-p port] [-d] [-v
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-l` | — | Run on the local system (no SSH) |
+| `-c` | — | Validate: check GDS config and parse `gdscheck -p` output |
 | `-u user` | `root` | SSH username (uses `sudo` automatically if not root) |
 | `-k file` | — | SSH private key file |
 | `-p port` | `22` | SSH port |
@@ -72,6 +73,15 @@ sudo ./configure_gds.sh -l -d -v
 
 # Plan only — see what would change without applying
 ./configure_gds.sh hosts.txt -u ubuntu -d -v
+
+# Validate local GDS configuration
+sudo ./configure_gds.sh -l -c
+
+# Validate remote hosts
+./configure_gds.sh hosts.txt -u ubuntu -c
+
+# Configure then validate
+./configure_gds.sh hosts.txt -u ubuntu -f && ./configure_gds.sh hosts.txt -u ubuntu -c
 ```
 
 ## Example output
@@ -104,6 +114,37 @@ Apply these changes? [y/N] y
 Applied:     2
 Up to date:  1
 Failed:      0
+```
+
+### Validation output (`-c`)
+
+```
+[09:20:00] Validating GDS configuration on 2 host(s) in parallel...
+
+========== [10.0.68.50] ==========
+  === System Checks ===
+  [PASS]  nvidia_fs module: loaded
+  [PASS]  nvidia_peermem module: loaded
+  [PASS]  libcufile_rdma.so: found in linker cache
+  [PASS]  /etc/cufile.json: exists
+  === GDS Validation ===
+  [PASS]  WekaFS: Supported
+  [PASS]  Userspace RDMA: Supported
+  [PASS]  Mellanox PeerDirect: Enabled
+  [PASS]  RDMA library: Loaded (libcufile_rdma.so)
+  [PASS]  RDMA devices: Configured
+  [PASS]  RDMA device status: Up: 16 Down: 0
+  [PASS]  use_compat_mode: false
+  [PASS]  gds_rdma_write_support: true
+  [PASS]  fs.weka.rdma_write_support: true
+  [PASS]  Platform verification: succeeded
+  === GPU Status ===
+  [PASS]  All 8 GPU(s) support GDS
+  RESULT: PASS — GDS is properly configured
+
+=== Validation Summary ===
+Passed:  2 / 2
+Failed:  0
 ```
 
 ## Requirements
