@@ -456,26 +456,47 @@ with open(tmpfile) as f:
         print(f"[ERROR] Failed to parse JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
+changes = []
+
+# --- properties section ---
 props = current.setdefault("properties", {})
+
+# rdma_dev_addr_list: merge detected devices
 existing = props.get("rdma_dev_addr_list", [])
 if not isinstance(existing, list):
     print(f"[WARN]  rdma_dev_addr_list was not a list ({type(existing).__name__}), resetting to []",
           file=sys.stderr)
     existing = []
-
 merged = list(existing)
-added = []
 for d in new_devs:
     if d not in merged:
         merged.append(d)
-        added.append(d)
-
+        changes.append(f"rdma_dev_addr_list: added {d}")
 props["rdma_dev_addr_list"] = merged
 
-if not added:
+# use_compat_mode / allow_compat_mode: must be false for GDS direct path
+for key in ("use_compat_mode", "allow_compat_mode"):
+    if props.get(key) is not False:
+        props[key] = False
+        changes.append(f"{key}: set to false")
+
+# gds_rdma_write_support: must be true
+if props.get("gds_rdma_write_support") is not True:
+    props["gds_rdma_write_support"] = True
+    changes.append("gds_rdma_write_support: set to true")
+
+# --- fs.weka section ---
+fs = current.setdefault("fs", {})
+weka = fs.setdefault("weka", {})
+if weka.get("rdma_write_support") is not True:
+    weka["rdma_write_support"] = True
+    changes.append("fs.weka.rdma_write_support: set to true")
+
+if not changes:
     print("NO_CHANGES", file=sys.stderr)
 else:
-    print(f"ADDED:{','.join(added)}", file=sys.stderr)
+    for c in changes:
+        print(f"CHANGE:{c}", file=sys.stderr)
 
 print(json.dumps(current, indent=2))
 PYEOF
@@ -495,9 +516,17 @@ PYEOF
         done
         devs_json+="]"
 
-        NEW_JSON=$(jq --argjson new_devs "$devs_json" \
-            '.properties.rdma_dev_addr_list = ((.properties.rdma_dev_addr_list // []) + $new_devs | unique)' \
-            "$TMPJSON") \
+        NEW_JSON=$(jq --argjson new_devs "$devs_json" '
+            # Merge RDMA devices
+            .properties.rdma_dev_addr_list = ((.properties.rdma_dev_addr_list // []) + $new_devs | unique) |
+            # Disable compat mode for GDS direct path
+            .properties.use_compat_mode = false |
+            .properties.allow_compat_mode = false |
+            # Enable RDMA write support
+            .properties.gds_rdma_write_support = true |
+            # Enable WEKA RDMA write support
+            .fs.weka.rdma_write_support = true
+        ' "$TMPJSON") \
             || { rm -f "$TMPJSON"; echo "[ERROR] jq JSON manipulation failed"; return 1; }
     else
         rm -f "$TMPJSON"
@@ -508,22 +537,20 @@ PYEOF
     rm -f "$TMPJSON"
     echo "[INFO]  JSON updated using $JSON_TOOL"
 
-    # Check if no changes were needed by comparing old vs new rdma_dev_addr_list
+    # Check if no changes were needed by comparing full sorted JSON
     local no_changes=false
-    local old_list new_list
+    local old_norm new_norm
     if [[ "$JSON_TOOL" == "python3" ]]; then
-        old_list=$(echo "$EXISTING_JSON" | python3 -c \
-            'import json,sys; d=json.load(sys.stdin); print(sorted(d.get("properties",{}).get("rdma_dev_addr_list",[])))' 2>/dev/null || echo "[]")
-        new_list=$(echo "$NEW_JSON" | python3 -c \
-            'import json,sys; d=json.load(sys.stdin); print(sorted(d.get("properties",{}).get("rdma_dev_addr_list",[])))' 2>/dev/null || echo "[]")
+        old_norm=$(echo "$EXISTING_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin),sort_keys=True))' 2>/dev/null || echo "")
+        new_norm=$(echo "$NEW_JSON"      | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin),sort_keys=True))' 2>/dev/null || echo "")
     else
-        old_list=$(echo "$EXISTING_JSON" | jq -r '.properties.rdma_dev_addr_list // [] | sort | join(",")' 2>/dev/null || echo "")
-        new_list=$(echo "$NEW_JSON"      | jq -r '.properties.rdma_dev_addr_list // [] | sort | join(",")' 2>/dev/null || echo "")
+        old_norm=$(echo "$EXISTING_JSON" | jq -S '.' 2>/dev/null || echo "")
+        new_norm=$(echo "$NEW_JSON"      | jq -S '.' 2>/dev/null || echo "")
     fi
-    [[ "$old_list" == "$new_list" ]] && no_changes=true
+    [[ "$old_norm" == "$new_norm" ]] && no_changes=true
 
     if [[ "$no_changes" == true ]]; then
-        echo "[INFO]  No changes needed — rdma_dev_addr_list already up to date"
+        echo "[INFO]  No changes needed — configuration already up to date"
         return 0
     fi
 
@@ -565,6 +592,31 @@ PYEOF
     echo "[CHANGE] $CUFILE updated. rdma_dev_addr_list: $final_list"
 }
 
+# ---- System preparation ----
+ensure_nvidia_peermem() {
+    # nvidia_peermem (or nvidia-peermem) is required for GDS RDMA.
+    # It enables GPU peer memory access for RDMA NICs.
+    if lsmod | grep -q nvidia_peermem; then
+        echo "[INFO]  nvidia_peermem module already loaded"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] Would load nvidia_peermem kernel module"
+        return 0
+    fi
+
+    echo "[INFO]  Loading nvidia_peermem kernel module..."
+    if modprobe nvidia_peermem 2>/dev/null; then
+        echo "[CHANGE] nvidia_peermem module loaded"
+    elif modprobe nvidia-peermem 2>/dev/null; then
+        echo "[CHANGE] nvidia-peermem module loaded"
+    else
+        echo "[WARN]  Could not load nvidia_peermem — GDS RDMA may not function"
+        echo "[WARN]  Ensure nvidia-fs / nvidia-peermem packages are installed"
+    fi
+}
+
 # ---- Main remote execution ----
 main_remote() {
     # Step 1: Prerequisites
@@ -589,10 +641,13 @@ main_remote() {
         exit 0
     fi
 
-    # Step 5: Read/create cufile.json
+    # Step 5: Ensure nvidia_peermem is loaded (required for GDS RDMA)
+    ensure_nvidia_peermem
+
+    # Step 6: Read/create cufile.json
     read_or_create_cufile
 
-    # Step 6 & 7: Merge and write
+    # Step 7 & 8: Merge and write
     merge_and_write || exit 1
 
     exit 0
