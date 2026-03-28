@@ -946,6 +946,12 @@ run_phase() {
     local -a pids=()
     local i=0
 
+    # Build the remote command — use sudo when not connecting as root
+    local remote_cmd="DRY_RUN=${dry_run_val} bash -s"
+    if [[ "$LOCAL_MODE" != true && "$SSH_USER" != "root" ]]; then
+        remote_cmd="sudo DRY_RUN=${dry_run_val} bash -s"
+    fi
+
     # Launch all hosts in parallel
     for host in "${HOSTS[@]}"; do
         (
@@ -955,7 +961,7 @@ run_phase() {
                 output=$(get_remote_script | DRY_RUN="${dry_run_val}" bash -s 2>&1) || ec=$?
             else
                 output=$(get_remote_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
-                    "DRY_RUN=${dry_run_val} bash -s" 2>&1) || ec=$?
+                    "$remote_cmd" 2>&1) || ec=$?
             fi
             printf '%s\n' "$output" > "$tmpdir/${i}.out"
             echo "$ec" > "$tmpdir/${i}.exit"
