@@ -88,6 +88,7 @@ parse_args() {
         usage
     fi
 
+    OPTIND=1
     while getopts ":u:k:p:dvf" opt; do
         case "$opt" in
             u) SSH_USER="$OPTARG" ;;
@@ -204,6 +205,7 @@ detect_gpu_numa_nodes() {
     fi
 
     while IFS= read -r raw_id; do
+        raw_id="${raw_id//$'\r'/}"   # strip carriage returns
         [[ -z "$raw_id" ]] && continue
         # Normalize: lowercase, 4-char domain (e.g. 00000000:3B:00.0 -> 0000:3b:00.0)
         local lower domain rest
@@ -370,7 +372,7 @@ merge_and_write() {
 
     # Write existing JSON to a temp file for safe Python manipulation
     local TMPJSON
-    TMPJSON=$(mktemp /tmp/cufile_update.XXXXXX.json)
+    TMPJSON=$(mktemp /tmp/cufile_update.XXXXXX)
     echo "$EXISTING_JSON" > "$TMPJSON"
 
     local NEW_JSON=""
@@ -464,9 +466,13 @@ PYEOF
 
     if [[ "$DRY_RUN" == "true" ]]; then
         local preview
-        preview=$(echo "$NEW_JSON" | python3 -c \
-            'import json,sys; d=json.load(sys.stdin); print(d.get("properties",{}).get("rdma_dev_addr_list",[]))' \
-            2>/dev/null || echo "(python3 unavailable for preview)")
+        if [[ "$JSON_TOOL" == "python3" ]]; then
+            preview=$(echo "$NEW_JSON" | python3 -c \
+                'import json,sys; d=json.load(sys.stdin); print(d.get("properties",{}).get("rdma_dev_addr_list",[]))' \
+                2>/dev/null || echo "(parse error)")
+        else
+            preview=$(echo "$NEW_JSON" | jq '.properties.rdma_dev_addr_list' 2>/dev/null || echo "(parse error)")
+        fi
         echo "[DRY-RUN] Would backup $CUFILE to $BAK"
         echo "[DRY-RUN] Would write new config to $CUFILE"
         echo "[DRY-RUN] New rdma_dev_addr_list: $preview"
@@ -481,14 +487,18 @@ PYEOF
 
     # Atomic write via temp file + mv
     local TMPOUT
-    TMPOUT=$(mktemp /tmp/cufile_new.XXXXXX.json)
+    TMPOUT=$(mktemp /tmp/cufile_new.XXXXXX)
     echo "$NEW_JSON" > "$TMPOUT"
     mv "$TMPOUT" "$CUFILE"
 
     local final_list
-    final_list=$(echo "$NEW_JSON" | python3 -c \
-        'import json,sys; d=json.load(sys.stdin); print(d.get("properties",{}).get("rdma_dev_addr_list",[]))' \
-        2>/dev/null || echo "(see $CUFILE)")
+    if [[ "$JSON_TOOL" == "python3" ]]; then
+        final_list=$(echo "$NEW_JSON" | python3 -c \
+            'import json,sys; d=json.load(sys.stdin); print(d.get("properties",{}).get("rdma_dev_addr_list",[]))' \
+            2>/dev/null || echo "(see $CUFILE)")
+    else
+        final_list=$(echo "$NEW_JSON" | jq '.properties.rdma_dev_addr_list' 2>/dev/null || echo "(see $CUFILE)")
+    fi
     echo "[CHANGE] $CUFILE updated. rdma_dev_addr_list: $final_list"
 }
 
@@ -529,10 +539,15 @@ main_remote
 
 REMOTE_SCRIPT
 
-    # Process captured output
+    # Process captured output.
+    # For failed hosts, always show all output so the user can see why.
+    local show_all=false
+    [[ $exit_code -ne 0 ]] && show_all=true
+
     local line
     while IFS= read -r line; do
-        if [[ "$VERBOSE" == true ]]; then
+        [[ -z "$line" ]] && continue
+        if [[ "$VERBOSE" == true || "$show_all" == true ]]; then
             echo "[$host] $line"
         elif [[ "$line" == *"[ERROR]"* || "$line" == *"[WARN]"* || \
                 "$line" == *"[CHANGE]"* || "$line" == *"[DRY-RUN]"* ]]; then
