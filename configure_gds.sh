@@ -30,7 +30,6 @@ SSH_KEYFILE=""
 DRY_RUN=false
 VERBOSE=false
 FORCE=false
-IP_FILE=""
 
 declare -a HOSTS=()
 declare -A HOST_STATUS=()   # host -> SUCCESS | FAILED | SKIPPED
@@ -212,7 +211,6 @@ detect_gpu_numa_nodes() {
         domain="${lower%%:*}"
         rest="${lower#*:}"
         # strip leading zeros from domain, keep at least one char, then pad to 4
-        domain="${domain##0}"   # simple strip won't work for "0000", use sed
         domain=$(echo "$domain" | sed 's/^0*//')
         [[ -z "$domain" ]] && domain="0"
         while [[ ${#domain} -lt 4 ]]; do domain="0${domain}"; done
@@ -445,19 +443,19 @@ PYEOF
     rm -f "$TMPJSON"
     echo "[INFO]  JSON updated using $JSON_TOOL"
 
-    # Check if no changes were needed (python3 path signals this via stderr marker)
-    # For jq path, compare old and new lists
+    # Check if no changes were needed by comparing old vs new rdma_dev_addr_list
     local no_changes=false
+    local old_list new_list
     if [[ "$JSON_TOOL" == "python3" ]]; then
-        # NEW_JSON contains stdout; change status came via stderr to the subshell
-        # Re-run a quick check by comparing old vs new rdma_dev_addr_list
-        local old_list new_list
         old_list=$(echo "$EXISTING_JSON" | python3 -c \
             'import json,sys; d=json.load(sys.stdin); print(sorted(d.get("properties",{}).get("rdma_dev_addr_list",[])))' 2>/dev/null || echo "[]")
         new_list=$(echo "$NEW_JSON" | python3 -c \
             'import json,sys; d=json.load(sys.stdin); print(sorted(d.get("properties",{}).get("rdma_dev_addr_list",[])))' 2>/dev/null || echo "[]")
-        [[ "$old_list" == "$new_list" ]] && no_changes=true
+    else
+        old_list=$(echo "$EXISTING_JSON" | jq -r '.properties.rdma_dev_addr_list // [] | sort | join(",")' 2>/dev/null || echo "")
+        new_list=$(echo "$NEW_JSON"      | jq -r '.properties.rdma_dev_addr_list // [] | sort | join(",")' 2>/dev/null || echo "")
     fi
+    [[ "$old_list" == "$new_list" ]] && no_changes=true
 
     if [[ "$no_changes" == true ]]; then
         echo "[INFO]  No changes needed — rdma_dev_addr_list already up to date"
@@ -567,8 +565,8 @@ print_summary() {
 
     for host in "${HOSTS[@]}"; do
         case "${HOST_STATUS[$host]:-UNKNOWN}" in
-            SUCCESS) ((succeeded++)) ;;
-            FAILED)  ((failed++)) ;;
+            SUCCESS) succeeded=$(( succeeded + 1 )) ;;
+            FAILED)  failed=$(( failed + 1 )) ;;
         esac
     done
 
