@@ -168,27 +168,14 @@ build_ssh_opts() {
     fi
 }
 
-confirm_execution() {
+confirm_apply() {
     if [[ "$FORCE" == true ]]; then return; fi
-
     echo ""
-    echo "=== GDS Configuration Script v${SCRIPT_VERSION} ==="
-    if [[ "$LOCAL_MODE" == true ]]; then
-        echo "  Mode:     LOCAL"
-    else
-        echo "  Hosts:    ${#HOSTS[@]}"
-        echo "  User:     $SSH_USER"
-        echo "  Port:     $SSH_PORT"
-        [[ -n "$SSH_KEYFILE" ]] && echo "  Key:      $SSH_KEYFILE"
-    fi
-    echo "  Dry-run:  $DRY_RUN"
-    echo ""
-    read -r -p "Proceed? [y/N] " answer
+    read -r -p "Apply these changes? [y/N] " answer
     case "$answer" in
         [yY][eE][sS]|[yY]) ;;
         *) echo "Aborted."; exit 0 ;;
     esac
-    echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -948,57 +935,96 @@ REMOTE_SCRIPT
 }
 
 # ---------------------------------------------------------------------------
-# Per-host runner (dispatches to local bash or SSH)
+# Parallel phase runner
 # ---------------------------------------------------------------------------
-run_on_host() {
-    local host="$1"
-    local exit_code=0
-    local label="$host"
+run_phase() {
+    local dry_run_val="$1"  # "true" or "false"
+    local phase="$2"        # "plan" or "apply"
 
-    if [[ "$LOCAL_MODE" == true ]]; then
-        label="local"
-        echo "[$label] Running..."
-        local output
-        output=$(get_remote_script | DRY_RUN=${DRY_RUN} VERBOSE=${VERBOSE} bash -s 2>&1) \
-            || exit_code=$?
-    else
-        echo "[$label] Connecting..."
-        local output
-        output=$(get_remote_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
-            "DRY_RUN=${DRY_RUN} VERBOSE=${VERBOSE} bash -s" 2>&1) \
-            || exit_code=$?
-    fi
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/gds_config.XXXXXX)
+    local -a pids=()
+    local i=0
 
-    # Process captured output.
-    # For failed hosts, always show all output so the user can see why.
-    local show_all=false
-    [[ $exit_code -ne 0 ]] && show_all=true
+    # Launch all hosts in parallel
+    for host in "${HOSTS[@]}"; do
+        (
+            set +e  # prevent errexit from hiding results in subshell
+            local ec=0 output
+            if [[ "$LOCAL_MODE" == true ]]; then
+                output=$(get_remote_script | DRY_RUN="${dry_run_val}" bash -s 2>&1) || ec=$?
+            else
+                output=$(get_remote_script | ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" \
+                    "DRY_RUN=${dry_run_val} bash -s" 2>&1) || ec=$?
+            fi
+            printf '%s\n' "$output" > "$tmpdir/${i}.out"
+            echo "$ec" > "$tmpdir/${i}.exit"
+        ) &
+        pids+=($!)
+        i=$(( i + 1 ))
+    done
 
-    local line
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        if [[ "$VERBOSE" == true || "$show_all" == true ]]; then
-            echo "[$label] $line"
-        elif [[ "$line" == *"[ERROR]"* || "$line" == *"[WARN]"* || \
-                "$line" == *"[CHANGE]"* || "$line" == *"[DRY-RUN]"* ]]; then
-            echo "[$label] $line"
+    # Wait for all background jobs
+    wait "${pids[@]}" 2>/dev/null || true
+
+    # Collect and display results
+    i=0
+    for host in "${HOSTS[@]}"; do
+        local label="$host"
+        if [[ "$LOCAL_MODE" == true ]]; then label="local"; fi
+
+        local output exit_code has_changes=false
+        output=$(cat "$tmpdir/${i}.out" 2>/dev/null || echo "")
+        exit_code=$(cat "$tmpdir/${i}.exit" 2>/dev/null || echo "1")
+
+        echo "[$label]"
+
+        # Display output lines based on verbosity and phase
+        local show_all=false
+        [[ "$exit_code" != "0" ]] && show_all=true
+
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$VERBOSE" == true || "$show_all" == true ]]; then
+                echo "  $line"
+            elif [[ "$line" == *"[ERROR]"* || "$line" == *"[WARN]"* || \
+                    "$line" == *"[CHANGE]"* || "$line" == *"[DRY-RUN]"* || \
+                    "$line" == *"No changes needed"* ]]; then
+                echo "  $line"
+            fi
+            if [[ "$line" == *"[DRY-RUN]"* || "$line" == *"[CHANGE]"* ]]; then
+                has_changes=true
+            fi
+        done <<< "$output"
+
+        # Record host status
+        if [[ "$LOCAL_MODE" != true && "$exit_code" == "255" ]]; then
+            HOST_STATUS["$host"]="FAILED"
+            HOST_MESSAGE["$host"]="SSH connection failed (exit 255)"
+            echo "  -> FAILED (SSH connection)"
+        elif [[ "$exit_code" != "0" ]]; then
+            HOST_STATUS["$host"]="FAILED"
+            HOST_MESSAGE["$host"]="Script exited with code $exit_code"
+            echo "  -> FAILED (exit $exit_code)"
+        elif [[ "$has_changes" == true ]]; then
+            if [[ "$phase" == "plan" ]]; then
+                HOST_STATUS["$host"]="CHANGES"
+            else
+                HOST_STATUS["$host"]="SUCCESS"
+            fi
+            HOST_MESSAGE["$host"]="OK"
+        else
+            HOST_STATUS["$host"]="OK"
+            HOST_MESSAGE["$host"]="No changes needed"
+            echo "  No changes needed"
         fi
-    done <<< "$output"
+        echo ""
 
-    if [[ "$LOCAL_MODE" != true && $exit_code -eq 255 ]]; then
-        HOST_STATUS["$host"]="FAILED"
-        HOST_MESSAGE["$host"]="SSH connection failed (exit 255)"
-        echo "[$label] FAILED (SSH connection)"
-    elif [[ $exit_code -ne 0 ]]; then
-        HOST_STATUS["$host"]="FAILED"
-        HOST_MESSAGE["$host"]="Script exited with code $exit_code"
-        echo "[$label] FAILED (exit $exit_code)"
-    else
-        HOST_STATUS["$host"]="SUCCESS"
-        HOST_MESSAGE["$host"]="OK"
-        echo "[$label] SUCCESS"
-    fi
-    echo ""
+        i=$(( i + 1 ))
+    done
+
+    rm -rf "$tmpdir"
 }
 
 # ---------------------------------------------------------------------------
@@ -1006,18 +1032,20 @@ run_on_host() {
 # ---------------------------------------------------------------------------
 print_summary() {
     local total=${#HOSTS[@]}
-    local succeeded=0 failed=0
+    local succeeded=0 failed=0 up_to_date=0
 
     for host in "${HOSTS[@]}"; do
         case "${HOST_STATUS[$host]:-UNKNOWN}" in
             SUCCESS) succeeded=$(( succeeded + 1 )) ;;
+            OK)      up_to_date=$(( up_to_date + 1 )) ;;
             FAILED)  failed=$(( failed + 1 )) ;;
         esac
     done
 
     echo "=== Summary ==="
-    echo "Succeeded: $succeeded / $total"
-    echo "Failed:    $failed"
+    echo "Applied:     $succeeded"
+    echo "Up to date:  $up_to_date"
+    echo "Failed:      $failed"
 
     if [[ $failed -gt 0 ]]; then
         echo ""
@@ -1040,18 +1068,63 @@ main() {
     if [[ "$LOCAL_MODE" != true ]]; then
         build_ssh_opts
     fi
-    confirm_execution
 
+    # Phase 1: Plan — dry-run all hosts in parallel to discover changes
     if [[ "$LOCAL_MODE" == true ]]; then
-        log "Running GDS configuration locally..."
+        log "Querying local system for needed changes..."
     else
-        log "Starting GDS configuration for ${#HOSTS[@]} host(s)..."
+        log "Querying ${#HOSTS[@]} host(s) in parallel..."
     fi
     echo ""
 
+    run_phase "true" "plan"
+
+    # Tally plan results
+    local changes=0 up_to_date=0 failed=0
     for host in "${HOSTS[@]}"; do
-        run_on_host "$host"
+        case "${HOST_STATUS[$host]:-}" in
+            CHANGES) changes=$(( changes + 1 )) ;;
+            OK)      up_to_date=$(( up_to_date + 1 )) ;;
+            FAILED)  failed=$(( failed + 1 )) ;;
+        esac
     done
+
+    echo "=== Plan ==="
+    echo "  Changes needed:    $changes"
+    echo "  Already up to date: $up_to_date"
+    if [[ $failed -gt 0 ]]; then
+        echo "  Failed to query:   $failed"
+    fi
+
+    # If -d (dry-run only), stop after showing the plan
+    if [[ "$DRY_RUN" == true ]]; then
+        echo ""
+        return 0
+    fi
+
+    # Nothing to apply
+    if [[ $changes -eq 0 ]]; then
+        echo ""
+        echo "Nothing to apply."
+        return 0
+    fi
+
+    # Prompt before applying (unless -f)
+    confirm_apply
+    echo ""
+
+    # Phase 2: Apply — run all hosts in parallel for real
+    HOST_STATUS=()
+    HOST_MESSAGE=()
+
+    if [[ "$LOCAL_MODE" == true ]]; then
+        log "Applying changes locally..."
+    else
+        log "Applying changes to ${#HOSTS[@]} host(s) in parallel..."
+    fi
+    echo ""
+
+    run_phase "false" "apply"
 
     print_summary
 }
