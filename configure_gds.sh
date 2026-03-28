@@ -346,7 +346,20 @@ resolve_rdma_addresses() {
     # Resolve GPU-resident mlx device names to their IP addresses.
     # cufile.json rdma_dev_addr_list requires IPs for user-space RDMA (WEKA).
     # Only devices with an assigned IPv4 address are included.
+    # Management interfaces (carrying the default route) are excluded.
     declare -ga RDMA_ADDR_LIST=()
+
+    # Identify management interface(s) — those carrying the default route.
+    # These are not part of the storage data plane and should be excluded.
+    declare -A MGMT_IFACES=()
+    local def_iface
+    while IFS= read -r def_iface; do
+        [[ -n "$def_iface" ]] && MGMT_IFACES["$def_iface"]=1
+    done < <(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+
+    if [[ ${#MGMT_IFACES[@]} -gt 0 ]]; then
+        echo "[INFO]  Management interface(s) (default route): ${!MGMT_IFACES[*]} — will exclude from GDS"
+    fi
 
     local dev_name
     for dev_name in "${GPU_RESIDENT_DEVS[@]}"; do
@@ -361,6 +374,12 @@ resolve_rdma_addresses() {
         for iface in "$net_dir"/*/; do
             [[ -d "$iface" ]] || continue
             iface=$(basename "$iface")
+
+            # Skip management interfaces (carry the default route)
+            if [[ -n "${MGMT_IFACES[$iface]+x}" ]]; then
+                echo "[INFO]  $dev_name -> $iface (management interface, skipping)"
+                continue
+            fi
 
             # Get IPv4 addresses on this interface
             local ip
