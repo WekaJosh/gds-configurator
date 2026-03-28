@@ -1014,7 +1014,8 @@ echo "=== GDS Validation ==="
 # Helper: extract a value from gdscheck output
 gds_val() {
     local pattern="$1"
-    echo "$GDS_OUTPUT" | grep -i "$pattern" | head -1 | sed 's/^.*: *//'
+    # Use [^:]* (first colon only) — greedy .* would eat into values like "Up: 16 Down: 0"
+    echo "$GDS_OUTPUT" | grep -i "$pattern" | head -1 | sed 's/^[^:]*: *//'
 }
 
 # WekaFS
@@ -1059,8 +1060,8 @@ fi
 
 # RDMA device status — extract Up/Down counts
 status_line=$(gds_val "rdma_device_status")
-up_count=$(echo "$status_line" | grep -oP 'Up:\s*\K[0-9]+' || echo "0")
-down_count=$(echo "$status_line" | grep -oP 'Down:\s*\K[0-9]+' || echo "0")
+up_count=$(echo "$status_line" | grep -o 'Up: *[0-9]*' | grep -o '[0-9]*' || echo "0")
+down_count=$(echo "$status_line" | grep -o 'Down: *[0-9]*' | grep -o '[0-9]*' || echo "0")
 if [[ "$down_count" -eq 0 && "$up_count" -gt 0 ]]; then
     pass "RDMA device status: Up: $up_count Down: $down_count"
 elif [[ "$down_count" -gt 0 && "$up_count" -gt 0 ]]; then
@@ -1269,10 +1270,15 @@ run_validate() {
         exit_code=$(cat "$tmpdir/${i}.exit" 2>/dev/null || echo "1")
 
         echo "========== [$label] =========="
+
+        # Show all output for failed hosts so SSH errors etc. are visible
+        local show_all=false
+        [[ "$exit_code" != "0" ]] && show_all=true
+
         local line
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            if [[ "$VERBOSE" == true ]]; then
+            if [[ "$VERBOSE" == true || "$show_all" == true ]]; then
                 echo "  $line"
             elif [[ "$line" == *"[PASS]"* || "$line" == *"[FAIL]"* || \
                     "$line" == *"[WARN]"* || "$line" == *"RESULT:"* || \
