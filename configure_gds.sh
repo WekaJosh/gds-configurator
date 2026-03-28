@@ -340,6 +340,59 @@ find_gpu_resident_devs() {
     echo "[INFO]  GPU-resident mlx5 devices: ${GPU_RESIDENT_DEVS[*]}"
 }
 
+strip_json_comments() {
+    # cufile.json ships with C-style // comments which are not valid JSON.
+    # Strip them in-place before any JSON tool processes the file.
+    local file="$1"
+    if command -v python3 &>/dev/null; then
+        python3 - "$file" <<'STRIP_PYEOF'
+import sys
+
+def strip_comments(text):
+    result = []
+    i = 0
+    in_string = False
+    while i < len(text):
+        if in_string:
+            if text[i] == '\\' and i + 1 < len(text):
+                result.append(text[i:i+2])
+                i += 2
+                continue
+            if text[i] == '"':
+                in_string = False
+            result.append(text[i])
+            i += 1
+        else:
+            if text[i] == '"':
+                in_string = True
+                result.append(text[i])
+                i += 1
+            elif i + 1 < len(text) and text[i:i+2] == '//':
+                while i < len(text) and text[i] != '\n':
+                    i += 1
+            elif i + 1 < len(text) and text[i:i+2] == '/*':
+                i += 2
+                while i + 1 < len(text) and text[i:i+2] != '*/':
+                    i += 1
+                if i + 1 < len(text):
+                    i += 2
+            else:
+                result.append(text[i])
+                i += 1
+    return ''.join(result)
+
+filepath = sys.argv[1]
+with open(filepath) as f:
+    text = f.read()
+with open(filepath, 'w') as f:
+    f.write(strip_comments(text))
+STRIP_PYEOF
+    else
+        # sed fallback: strip // line comments (safe for cufile.json)
+        sed -i 's|[[:space:]]*//.*$||' "$file"
+    fi
+}
+
 read_or_create_cufile() {
     local CUFILE="/etc/cufile.json"
     declare -g FILE_EXISTED=false
@@ -375,10 +428,13 @@ merge_and_write() {
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     local BAK="${CUFILE}.bak.${TIMESTAMP}"
 
-    # Write existing JSON to a temp file for safe Python manipulation
+    # Write existing JSON to a temp file, strip C-style comments, then manipulate
     local TMPJSON
     TMPJSON=$(mktemp /tmp/cufile_update.XXXXXX)
     echo "$EXISTING_JSON" > "$TMPJSON"
+    strip_json_comments "$TMPJSON"
+    # Re-read cleaned JSON so comparisons later work correctly
+    EXISTING_JSON=$(cat "$TMPJSON")
 
     local NEW_JSON=""
     local JSON_TOOL=""
