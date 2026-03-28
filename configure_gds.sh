@@ -713,12 +713,8 @@ install_gds_packages() {
 }
 
 ensure_gds_installed() {
-    # Check if nvidia_fs kernel module is available
-    if lsmod | grep -q nvidia_fs; then
-        echo "[INFO]  nvidia_fs kernel module loaded"
-    elif modinfo nvidia_fs &>/dev/null; then
-        echo "[INFO]  nvidia_fs kernel module available (not loaded)"
-    else
+    # Check if nvidia_fs kernel module is available; install GDS if missing
+    if ! lsmod | grep -q nvidia_fs && ! modinfo nvidia_fs &>/dev/null; then
         echo "[WARN]  nvidia_fs kernel module not found — GDS is not installed"
         if [[ "$DRY_RUN" == "true" ]]; then
             detect_cuda_version
@@ -729,13 +725,28 @@ ensure_gds_installed() {
             fi
         else
             install_gds_packages || exit 1
-            # Verify the module is now available after install
             if ! modinfo nvidia_fs &>/dev/null; then
                 echo "[ERROR] nvidia_fs module still not available after install"
                 echo "[ERROR] A DKMS build may have failed — check dkms status"
                 exit 1
             fi
-            echo "[INFO]  nvidia_fs module now available"
+        fi
+    fi
+
+    # Ensure nvidia_fs is loaded (not just installed)
+    if lsmod | grep -q nvidia_fs; then
+        echo "[INFO]  nvidia_fs kernel module loaded"
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY-RUN] Would load nvidia_fs kernel module"
+        else
+            echo "[INFO]  Loading nvidia_fs kernel module..."
+            if modprobe nvidia_fs 2>/dev/null; then
+                echo "[CHANGE] nvidia_fs module loaded"
+            else
+                echo "[ERROR] Failed to load nvidia_fs module"
+                exit 1
+            fi
         fi
     fi
 
