@@ -163,7 +163,9 @@ build_ssh_opts() {
         -o LogLevel=ERROR
         -p "$SSH_PORT"
     )
-    [[ -n "$SSH_KEYFILE" ]] && SSH_OPTS+=(-i "$SSH_KEYFILE")
+    if [[ -n "$SSH_KEYFILE" ]]; then
+        SSH_OPTS+=(-i "$SSH_KEYFILE")
+    fi
 }
 
 confirm_execution() {
@@ -691,7 +693,9 @@ print_summary() {
 main() {
     parse_args "$@"
     validate_inputs
-    [[ "$LOCAL_MODE" != true ]] && build_ssh_opts
+    if [[ "$LOCAL_MODE" != true ]]; then
+        build_ssh_opts
+    fi
     confirm_execution
 
     if [[ "$LOCAL_MODE" == true ]]; then
